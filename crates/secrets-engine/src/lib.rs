@@ -1138,6 +1138,12 @@ impl Engine {
             issued_boottime_ms: row.issued_boottime_ms,
             client_uid: row.client_uid,
             client_pid: row.client_pid,
+            // Local-plane bearers carry no remote binding. The Phase-8 edge populates these from the
+            // persisted remote binding (client_id/dpop_jkt — F15 schema) when it lands; until then
+            // this control path mints/serves only local (uid/pid) bearers, so `decide()`'s remote
+            // clause treats every bearer here as local (no cross-kind, no DPoP requirement).
+            client_id: None,
+            dpop_jkt: None,
             revoked: row.revoked,
         };
         let canon = CanonRequest {
@@ -1151,6 +1157,9 @@ impl Engine {
             usage_requests: total_requests,
             usage_bytes: total_bytes,
             rate_in_window,
+            // Local (UDS) request: no remote presentation context. The Phase-8 edge constructs
+            // `CanonRequest` with `remote: Some(RemotePeer{..})` after verifying DPoP + TLS binding.
+            remote: None,
         };
 
         // 4. The PURE, default-deny decision (expiry fenced against BOTH the wall and monotonic

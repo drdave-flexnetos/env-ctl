@@ -48,10 +48,21 @@ linked), with the no-C / single-ring-backend gate materialized + armed at `ci/ga
    **links into `secretd`** (the daemon) when the libsql backend is selected — all pure-Rust, no C
    library (gate-proven). **Target** stays strict C-toolchain-free (blake3 `pure` + a pure-Rust Hrana
    client). See `crates/secrets-store-libsql/README.md` + `docs/ops/08-secretd-store-config.md`.
-2. **Remote edge (Phase 8, deferred by design):** the HTTPS + DPoP-sender-bound relay plane for remote
-   clients (e.g. a Telegram bot). The SERVER-MODE audit lists exactly what to bridge in (remote
-   bearer binding into `decide()`/schema, jti replay store, streaming revocation, public-edge TLS).
-   Control plane stays local-UDS-only.
+2. **Remote edge (Phase 8) — enforcement CORE landed; network listener is the next increment.**
+   The **binding-bypass risk the SERVER-MODE audit prioritised (F3/F4) is DONE**: `decide()` now has
+   the remote plane — `RemotePeer{client_id, dpop_jkt, dpop_verified}`, `CanonRequest.remote`,
+   `VerifiedBearer.client_id/dpop_jkt`, a cross-kind-presentation deny (both directions), DPoP-proof
+   fail-closed, and client_id/jkt proof-of-possession checks, with new `DenyReason`s
+   (`CrossKindPresentation`, `RemoteNoDPoP`, `RemoteBindingMismatch`, `RemoteClientUnknown`,
+   `RemoteClientRevoked`). 8 new table tests; local plane 100% preserved (`decide()` is pure +
+   forward-compatible — local construction sets the remote fields `None`). Audit F1 (the libSQL
+   "VERIFIED pure-Rust" doc defect) is also resolved: SERVER-MODE §2.2 now says PROVEN-by-gate, backed
+   by the real `ci/gates/no-c.sh` Gate 3a. **Remaining Phase-8 increments (SERVER-MODE audit is the
+   spec):** F2 in-process TLS+DPoP/EKM listener (`crates/secretd/src/edge`, the only thing that
+   *serves*), F15 schema columns (`client_id`/`dpop_jkt`/`kind` + `remote_clients`) + mint/swap wiring,
+   F12 plane-bound row MAC, F6 bounded jti replay store, F5 streaming revocation tear-down, F14
+   PresenceGate trait (Phase-0 refactor, unblocks VPS), F7–F9 VPS Profile-B gates. The listener MUST
+   NOT serve until F15/F12 wire the remote fields through mint/store. Control plane stays local-UDS-only.
 3. **Merge into envctl** — see "Merge workflow" below.
 
 ---

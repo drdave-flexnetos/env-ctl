@@ -32,10 +32,44 @@ pub enum DenyReason {
     RateLimited,
     GateAbsent,
     ClockRollback,
+    // ---- remote plane (Phase 8 — REQ-SEC-10 / FS-S16, SERVER-MODE §4.2 clause 4) ----
+    /// A remote request presented a LOCAL (uid/pid) bearer, or a local request presented a REMOTE
+    /// (client_id) bearer. The two planes never cross.
+    CrossKindPresentation,
+    /// A remote request reached `decide()` without a verified DPoP proof. The edge MUST verify the
+    /// RFC 9449 proof + TLS channel binding BEFORE `decide()`; a `false` here is a broken/bypassed
+    /// edge and is failed closed (proof failure normally 401s at the edge and never reaches here).
+    RemoteNoDPoP,
+    /// The presented `client_id` or DPoP key thumbprint (`jkt`) does not match the bearer's bound
+    /// remote identity — a client-binding / proof-of-possession failure.
+    RemoteBindingMismatch,
+    /// The presented `client_id` is not a registered remote client. Raised by the edge/`relay_swap`
+    /// BEFORE `decide()` (mirroring `UnknownBearer`); defined here for audit granularity (F4).
+    RemoteClientUnknown,
+    /// The remote client's registration was revoked. Raised by the edge/`relay_swap` before
+    /// `decide()`; defined here for audit granularity (F4).
+    RemoteClientRevoked,
+}
+
+/// The verified remote-presentation context the Phase-8 edge attaches to a remote request. The edge
+/// MUST, before constructing this: (1) terminate TLS IN-PROCESS (FS-S20), (2) verify the RFC 9449
+/// DPoP proof against `dpop_jkt`, and (3) bind the proof to the TLS channel (EKM) — only then set
+/// `dpop_verified = true`. `decide()` fails closed (`RemoteNoDPoP`) if `dpop_verified` is false, so a
+/// broken edge that forgets to verify can never produce an `Allow`.
+#[derive(Clone, Debug)]
+pub struct RemotePeer {
+    /// The registered remote-client identity presented on this request.
+    pub client_id: String,
+    /// RFC 7638 JWK SHA-256 thumbprint of the DPoP public key proven on this request.
+    pub dpop_jkt: [u8; 32],
+    /// Set true ONLY after the edge verified the DPoP proof + channel binding.
+    pub dpop_verified: bool,
 }
 
 /// A bearer that has already been looked up + constant-time verified against the store — BOTH the
-/// wire MAC AND the DEK-keyed row MAC (so every field below is authenticated, not clear-text).
+/// wire MAC AND the DEK-keyed row MAC (so every field below is authenticated, not clear-text) —
+/// EXCEPT the Phase-8 remote fields `client_id`/`dpop_jkt`, which the current row MAC does NOT yet
+/// cover and which are always `None` (and never read from the store) until F12/F15 land (see below).
 pub struct VerifiedBearer {
     pub policy_id: i64,
     pub token_id: String,
@@ -45,6 +79,16 @@ pub struct VerifiedBearer {
     pub issued_boottime_ms: i64,
     pub client_uid: Option<u32>,
     pub client_pid: Option<u32>,
+    /// Remote binding (Phase 8): the registered remote client this bearer is bound to. `None` for a
+    /// local uid/pid bearer. A bearer is REMOTE iff `client_id.is_some()` — the two planes are
+    /// mutually exclusive by construction (mint binds exactly one). NOT YET row-MAC-authenticated:
+    /// the plane-bound MAC (audit F12) + the schema column (F15) are deferred, so until they land
+    /// this field is always `None` at the sole construction site and never sourced from the store.
+    /// (When F15's `register-remote`/mint lands it MUST forbid an empty/blank `client_id`.)
+    pub client_id: Option<String>,
+    /// The DPoP public-key thumbprint (RFC 7638) the remote bearer is bound to. `None` for local.
+    /// Same F12/F15 deferral as `client_id`: not yet row-MAC-covered; `None` until the edge wiring lands.
+    pub dpop_jkt: Option<[u8; 32]>,
     pub revoked: bool,
 }
 
@@ -70,6 +114,10 @@ pub struct CanonRequest {
     pub usage_bytes: u64,
     /// Requests already counted in the trailing 60s sliding window INCLUDING this one.
     pub rate_in_window: u32,
+    /// The verified remote-presentation context, set by the Phase-8 edge for a remote request; `None`
+    /// for a local (UDS) request. Its presence selects the remote binding plane in `decide()` (and a
+    /// presence/absence mismatch vs the bearer's kind is denied as `CrossKindPresentation`).
+    pub remote: Option<RemotePeer>,
 }
 
 /// Pure decision: asserts policy↔bearer linkage, expiry vs the WALL clock AND the MONOTONIC
@@ -136,7 +184,32 @@ pub fn decide(
     if !host_in(&req.host, canonical_upstreams(p.provider)) {
         return deny(DenyReason::UpstreamNotAllowed);
     }
-    // 11. PeerMismatch — a bound bearer presented by another uid/pid is rejected (HF-8).
+    // 11a. Plane binding (REQ-SEC-10 / FS-S16, SERVER-MODE §4.2 clause 4) — MUST precede the local
+    // peer check so a cross-kind presentation reports `CrossKindPresentation`, not `PeerMismatch`.
+    // A bearer is LOCAL (uid/pid bound) or REMOTE (client_id + dpop_jkt bound); the planes never
+    // cross. For a remote presentation, the edge must have verified the DPoP proof + TLS channel
+    // binding (FS-S20) and the presented client_id + jkt must equal the bearer's authenticated
+    // binding (proof-of-possession). `dpop_verified == false` fails closed (a broken/bypassed edge).
+    match (&req.remote, b.client_id.is_some()) {
+        (Some(rp), true) => {
+            if !rp.dpop_verified {
+                return deny(DenyReason::RemoteNoDPoP);
+            }
+            if b.client_id.as_deref() != Some(rp.client_id.as_str()) {
+                return deny(DenyReason::RemoteBindingMismatch);
+            }
+            if b.dpop_jkt.as_ref() != Some(&rp.dpop_jkt) {
+                return deny(DenyReason::RemoteBindingMismatch);
+            }
+        }
+        // Remote request presenting a LOCAL bearer.
+        (Some(_), false) => return deny(DenyReason::CrossKindPresentation),
+        // Local request presenting a REMOTE bearer.
+        (None, true) => return deny(DenyReason::CrossKindPresentation),
+        // Local request + local bearer: fall through to the uid/pid check below.
+        (None, false) => {}
+    }
+    // 11b. PeerMismatch — a bound LOCAL bearer presented by another uid/pid is rejected (HF-8).
     if let Some(bound_uid) = b.client_uid {
         if req.peer_uid != Some(bound_uid) {
             return deny(DenyReason::PeerMismatch);
@@ -280,6 +353,8 @@ mod tests {
             issued_boottime_ms: BOOTTIME - (NOW - ISSUED),
             client_uid: Some(1000),
             client_pid: None,
+            client_id: None,
+            dpop_jkt: None,
             revoked: false,
         }
     }
@@ -296,7 +371,35 @@ mod tests {
             usage_requests: 1,
             usage_bytes: 128,
             rate_in_window: 1,
+            remote: None,
         }
+    }
+
+    // ---- remote-plane (Phase 8) helpers ----
+    const JKT_A: [u8; 32] = [0xAA; 32];
+    const JKT_B: [u8; 32] = [0xBB; 32];
+
+    /// A REMOTE bearer: bound to client_id + dpop_jkt, NOT to a local uid/pid.
+    fn remote_bearer() -> VerifiedBearer {
+        let mut b = base_bearer();
+        b.client_uid = None;
+        b.client_pid = None;
+        b.client_id = Some("phone".to_string());
+        b.dpop_jkt = Some(JKT_A);
+        b
+    }
+
+    /// A REMOTE request: carries a verified RemotePeer (matching `remote_bearer`) and NO local peer.
+    fn remote_req() -> CanonRequest {
+        let mut r = base_req();
+        r.peer_uid = None;
+        r.peer_pid = None;
+        r.remote = Some(RemotePeer {
+            client_id: "phone".to_string(),
+            dpop_jkt: JKT_A,
+            dpop_verified: true,
+        });
+        r
     }
 
     fn run(p: &RelayPolicy, b: &VerifiedBearer, r: &CanonRequest) -> RelayDecision {
@@ -536,5 +639,94 @@ mod tests {
         let mut p = base_policy();
         p.path_allow = vec!["/v1/*".to_string()];
         assert_eq!(run(&p, &base_bearer(), &base_req()), RelayDecision::Allow);
+    }
+
+    // ---- remote plane (Phase 8 — REQ-SEC-10 / FS-S16) ----
+
+    #[test]
+    fn remote_baseline_allows() {
+        // A registered remote bearer + a verified DPoP presentation with matching client_id + jkt.
+        assert_eq!(
+            run(&base_policy(), &remote_bearer(), &remote_req()),
+            RelayDecision::Allow
+        );
+    }
+
+    #[test]
+    fn cross_kind_remote_bearer_over_local_request() {
+        // A REMOTE bearer presented over the local UDS (req.remote == None) is denied cross-kind —
+        // NOT silently treated as a local bearer.
+        assert_deny(
+            &base_policy(),
+            &remote_bearer(),
+            &base_req(),
+            DenyReason::CrossKindPresentation,
+        );
+    }
+
+    #[test]
+    fn cross_kind_local_bearer_over_remote_request() {
+        // A LOCAL (uid) bearer presented over the remote edge is denied cross-kind (caught BEFORE the
+        // uid/pid PeerMismatch check, so the reason is precise).
+        assert_deny(
+            &base_policy(),
+            &base_bearer(),
+            &remote_req(),
+            DenyReason::CrossKindPresentation,
+        );
+    }
+
+    #[test]
+    fn remote_no_dpop_fails_closed() {
+        // A remote request that reaches decide() without a verified proof (broken/bypassed edge) is
+        // failed closed rather than allowed.
+        let mut r = remote_req();
+        r.remote.as_mut().unwrap().dpop_verified = false;
+        assert_deny(&base_policy(), &remote_bearer(), &r, DenyReason::RemoteNoDPoP);
+    }
+
+    #[test]
+    fn remote_client_id_mismatch_denied() {
+        // The presented client_id does not match the bearer's bound client.
+        let mut r = remote_req();
+        r.remote.as_mut().unwrap().client_id = "laptop".to_string();
+        assert_deny(
+            &base_policy(),
+            &remote_bearer(),
+            &r,
+            DenyReason::RemoteBindingMismatch,
+        );
+    }
+
+    #[test]
+    fn remote_jkt_mismatch_denied() {
+        // The proven DPoP key thumbprint does not match the bearer's bound jkt (proof-of-possession
+        // failure — a stolen bearer replayed with a different key).
+        let mut r = remote_req();
+        r.remote.as_mut().unwrap().dpop_jkt = JKT_B;
+        assert_deny(
+            &base_policy(),
+            &remote_bearer(),
+            &r,
+            DenyReason::RemoteBindingMismatch,
+        );
+    }
+
+    #[test]
+    fn remote_bearer_still_subject_to_baseline_checks() {
+        // The remote plane does NOT bypass the existing allowlist/quota fences: a remote bearer to a
+        // disallowed host is still denied (defense-in-depth ordering preserved).
+        let mut r = remote_req();
+        r.host = "evil.example".to_string();
+        r.sni = Some("evil.example".to_string()); // keep SNI==host so HostNotAllowed (7) fires first
+        assert_deny(&base_policy(), &remote_bearer(), &r, DenyReason::HostNotAllowed);
+    }
+
+    #[test]
+    fn remote_bearer_revoked_denied() {
+        // A revoked remote bearer is denied (the existing BearerRevoked check precedes plane binding).
+        let mut b = remote_bearer();
+        b.revoked = true;
+        assert_deny(&base_policy(), &b, &remote_req(), DenyReason::BearerRevoked);
     }
 }
