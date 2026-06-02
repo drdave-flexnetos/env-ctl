@@ -1,0 +1,142 @@
+syntax = "proto3";
+package env_ctl.v1;
+
+// env-ctl control-plane contract (gRPC over a Unix-domain socket; authz by SO_PEERCRED uid==owner).
+// Wire mirror of the engine's SecretEvent enum; a CI round-trip test guarantees no drift.
+//
+// REVIEW FIX (CF-8, fail-closed): every destructive RPC carries a POSITIVELY-PHRASED `bool apply`
+// (proto3 scalar default = false = DRY-RUN = the safe state) plus `bool confirm` for root-of-trust
+// ops. An omitted/old/replayed client therefore transmits apply=false and the daemon treats it as
+// dry-run. There is NO `bool dry_run` field anywhere (it would default to false = APPLY = unsafe).
+
+// ===== shared enums =====
+enum ProviderKind { PROVIDER_UNSPECIFIED = 0; ANTHROPIC = 1; OPENAI = 2; GITHUB = 3; GENERIC = 4; }
+enum DataPlaneMode { MODE_UNSPECIFIED = 0; BASE_URL_REPOINT = 1; HTTPS_PROXY_MITM = 2; NATIVE_SUBTOKEN = 3; }
+
+// The Event stream — wire mirror of the engine's SecretEvent enum. Every mutating
+// RPC server-streams these; the CLI drains them exactly like envctl's rx.iter().
+message Event {
+  oneof kind {
+    VaultUnlocked vault_unlocked = 1;
+    VaultLocked   vault_locked   = 2;
+    Log           log            = 3;
+    SecretWritten secret_written = 4;
+    RelayMinted   relay_minted   = 5;
+    RelaySwapped  relay_swapped  = 6;
+    GuardRefused  guard_refused  = 7;
+    CaIssued      ca_issued      = 8;
+    LeafMinted    leaf_minted    = 9;
+    ChildExited   child_exited   = 10;
+    RunFinished   run_finished   = 11;
+  }
+}
+message VaultUnlocked { string factor = 1; }       // "usb" | "passphrase"
+message VaultLocked   {}
+message Log           { string source = 1; uint32 stream = 2; string line = 3; } // stream: 0=stdout 1=stderr
+message SecretWritten { string name = 1; uint32 version = 2; }
+message RelayMinted   { string relay = 1; string kind = 2; string expires_at = 3; } // bearer NEVER on the wire here
+// REVIEW FIX (OI-11): per-swap traceability — token_id + client identity so an audit row keys to
+// exactly one bearer -> one (client, 24h window). bearer is NEVER included.
+message RelaySwapped  { string relay = 1; string host = 2; string method = 3; bool allowed = 4;
+                        string token_id = 5; uint32 client_uid = 6; string client_label = 7; }
+message GuardRefused  { string subject = 1; string reason = 2; }
+message CaIssued      { string serial = 1; string cn = 2; string not_after = 3; }
+message LeafMinted    { string sni = 1; string relay = 2; string not_after = 3; }
+message ChildExited   { int32 code = 1; }
+message RunSummary    { repeated string failed = 1; repeated string refused = 2; }
+message RunFinished   { RunSummary summary = 1; }
+
+// ===== Vault: secrets CRUD =====
+service Vault {
+  rpc Add    (AddSecretReq)  returns (stream Event);   // additive; backs up on overwrite
+  rpc Get    (GetSecretReq)  returns (GetSecretResp);  // unary; metadata only unless apply+confirm reveal; audited
+  rpc List   (ListSecretReq) returns (ListSecretResp); // unary; metadata only
+  rpc Rm     (RmSecretReq)   returns (stream Event);   // destructive: apply-gated (default dry-run)
+  rpc Rotate (RotateReq)     returns (stream Event);   // destructive: apply-gated (full DEK/body re-seal where applicable)
+}
+message SecretMeta    { string name = 1; ProviderKind provider = 2; string created_at = 3; uint32 version = 4; string note = 5; bool broker_only = 6; }
+message AddSecretReq  { string name = 1; ProviderKind provider = 2; bytes value = 3; string note = 4; bool overwrite = 5; bool broker_only = 6; }
+// REVIEW FIX (HF-5/OI-2): reveal is the single by-design TCB escape hatch. Default metadata-only;
+// raw value returned ONLY when apply=true (+ confirm), audited, and REFUSED for broker_only secrets.
+message GetSecretReq  { string name = 1; bool reveal = 2; bool apply = 3; bool confirm = 4; }
+message GetSecretResp { SecretMeta meta = 1; bytes value = 2; bool revealed = 3; } // value empty unless revealed
+message ListSecretReq { optional ProviderKind provider = 1; }
+message ListSecretResp{ repeated SecretMeta items = 1; }
+message RmSecretReq   { string name = 1; bool apply = 2; bool confirm = 3; }       // apply=false => dry-run (CF-8)
+message RotateReq     { string name = 1; bytes new_value = 2; bool apply = 3; }    // apply=false => dry-run (CF-8)
+
+// ===== Relay: policies + bearer mint (USB-possession-gated, <=24h wire TTL) =====
+service Relay {
+  rpc Create       (CreateRelayReq)  returns (stream Event);  // named policy (additive)
+  rpc Revoke       (RevokeRelayReq)  returns (RevokeResp);    // destructive: apply-gated; reports count flipped
+  rpc RevokeBearer (RevokeBearerReq) returns (RevokeResp);    // REVIEW FIX (OI-10): revoke ONE leaked bearer
+  rpc List         (ListRelayReq)    returns (ListRelayResp); // unary
+  rpc Mint         (MintReq)         returns (MintResp);      // mints a <=24h peer-bound bearer + ResolvedInjection
+}
+message RelayPolicy {
+  string name = 1; string secret_name = 2; ProviderKind provider = 3; DataPlaneMode mode = 4;
+  repeated string host_allow = 5; repeated string path_allow = 6; repeated string method_allow = 7;
+  string expires_at = 8;                  // POLICY lifetime (1y/90d); the WIRE bearer is always <=24h
+  uint32 rate_per_min = 9; uint64 quota_total = 10; bool enabled = 11; bool ephemeral = 12;
+  string upstream_base = 13;              // REVIEW FIX (HF-11): constrained to the provider's canonical upstream host allowlist
+}
+message CreateRelayReq { RelayPolicy policy = 1; }
+message RevokeRelayReq { string name = 1; bool apply = 2; bool confirm = 3; }      // apply=false => dry-run (CF-8)
+message RevokeBearerReq{ string token_id = 1; bool apply = 2; }                    // apply=false => dry-run
+message RevokeResp     { uint32 count_revoked = 1; bool dry_run = 2; }             // HF-16: fail-closed, count-reporting
+message ListRelayReq   { bool include_revoked = 1; }
+message ListRelayResp  { repeated RelayPolicy items = 1; }
+// REVIEW FIX (HF-15): requested_ttl is clamped server-side via the single clamp_ttl choke point to
+// min(requested, policy, 86400); values that do not fit i64 are rejected (not wrapped). USB-gated.
+message MintReq        { string relay = 1; bool ephemeral = 2; ProviderKind provider = 3; uint64 ttl_secs = 4;
+                         uint32 client_pid = 5; }   // peer-bind target for `env-ctl run` ephemerals (HF-8)
+message MintResp       { string bearer = 1; string expires_at = 2; ResolvedInjection injection = 3; string token_id = 4; }
+// the provider-shaped env delta the CLI overlays onto the CHILD env only.
+message ResolvedInjection { ProviderKind provider = 1; DataPlaneMode mode = 2; map<string, string> env = 3; repeated string ca_env_keys = 4; string proxy_url = 5; string base_url = 6; }
+
+// ===== Certs: local CA + leaves + trust wiring =====
+service Certs {
+  rpc CaInit     (CaInitReq)    returns (stream Event);  // destructive if exists: apply-gated
+  rpc CaRotate   (CaRotateReq)  returns (stream Event);  // root-of-trust: apply + confirm
+  rpc Issue      (IssueLeafReq) returns (stream Event);  // additive; REFUSES usage=mitm_leaf (CF-5)
+  rpc Renew      (RenewLeafReq) returns (stream Event);
+  rpc Revoke     (RevokeLeafReq)returns (stream Event);  // destructive: apply-gated
+  rpc TrustApply (TrustReq)     returns (stream Event);  // wires CA env / system bundle (reversible, owned-file-only)
+  rpc List       (ListCertReq)  returns (ListCertResp);
+}
+// usage values for Issue: 'control_plane_server' | 'control_plane_client' ONLY.
+// MITM leaves are NEVER mintable here — they are minted in-RAM inside the relay-gated proxy resolver.
+message CaInitReq    { bool apply = 1; bool confirm = 2; }
+message CaRotateReq  { bool apply = 1; bool confirm = 2; }                         // root-of-trust: needs both
+message IssueLeafReq { string cn = 1; repeated string sans = 2; uint64 ttl_days = 3; string usage = 4; } // usage must not be mitm_leaf
+message RenewLeafReq { string cn = 1; bool apply = 2; }
+message RevokeLeafReq{ string cn = 1; bool apply = 2; bool confirm = 3; }
+// REVIEW FIX (CF-7/FS-S11): system_bundle is root-of-trust (apply+confirm), default OFF; the CA is
+// written ONLY to an owned discrete file and reverted by deleting that file + regenerating.
+message TrustReq     { repeated string targets = 1; bool system_bundle = 2; bool apply = 3; bool confirm = 4; } // targets: node|python|git|curl|openssl|all
+message ListCertReq  {}
+message ListCertResp { repeated CertMeta items = 1; }
+message CertMeta     { string cn = 1; bool is_ca = 2; string not_after = 3; bool revoked = 4; repeated string sans = 5; string usage = 6; }
+
+// ===== Lock: unlock/lock/status (USB-first, passphrase fallback) =====
+service Lock {
+  rpc Status  (StatusReq) returns (StatusResp);   // unary; no unlock side-effect
+  rpc Unlock  (UnlockReq) returns (stream Event); // USB-first; passphrase only if USB absent
+  rpc LockNow (LockReq)   returns (stream Event); // zeroize the DEK + CA Issuer in RAM (the true panic stop)
+}
+message StatusReq  {}
+// REVIEW FIX (CF-4): usb_partuuid REMOVED from the wire — it leaked the gate selector to any control
+// client. Presence is reported as a possession-proven boolean only.
+message StatusResp { bool unlocked = 1; bool usb_possessed = 2; uint32 active_relays = 3; uint32 secret_count = 4; }
+// passphrase is zeroized immediately on the daemon side after derivation (HF-5).
+message UnlockReq  { optional string passphrase = 1; } // omitted => USB-only
+message LockReq    {}
+
+// ===== Audit: tamper-evident, hash-chained log query (written DURABLY before security RPCs return) =====
+service Audit {
+  rpc Query (AuditQueryReq) returns (AuditQueryResp);
+}
+message AuditQueryReq { optional string actor = 1; optional string relay = 2; optional string since = 3; optional string until = 4; uint32 limit = 5; }
+message AuditQueryResp{ repeated AuditEntry entries = 1; }
+message AuditEntry { string at = 1; string actor = 2; string action = 3; string target = 4; string relay = 5;
+                     string detail = 6; string prev_hash = 7; string hash = 8; string token_id = 9; }
