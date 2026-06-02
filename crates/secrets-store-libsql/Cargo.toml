@@ -1,0 +1,51 @@
+# envctl-secrets-store-libsql
+#
+# CONDITIONAL CRATE — NOT a member of the root [workspace]. See README.md (audit F1).
+#
+# The C-purity gate the DESIGN specified greps for `libsql-ffi|libsql-sys|sqlite3-sys` and PASSES
+# for `libsql` with `default-features=false, features=["remote"]` (the C-SQLite `core` path is NOT
+# pulled). BUT the `remote` feature transitively pulls `libsql-sqlite3-parser`, whose build.rs
+# compiles `third_party/lemon/lemon.c` with `cc` to codegen the SQL grammar — so a C TOOLCHAIN is
+# still required at BUILD time. That fails the SPIRIT of audit F1 ("no C in the remote client"),
+# so this crate is deliberately kept OUT of [workspace.members]; the workspace stays on inmem-store.
+#
+# An empty `[workspace]` table makes this crate its OWN workspace root so it can be built/inspected
+# standalone (`cargo build` / `cargo tree` from this dir) WITHOUT being absorbed by the root
+# env-ctl workspace. Remove this table and add the path to ../../Cargo.toml [workspace.members]
+# ONLY if/when a C-toolchain-free remote path lands (reopen OI-1).
+[workspace]
+
+[package]
+name = "envctl-secrets-store-libsql"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "libSQL Store backend (C-quarantined, remote-client only) — CONDITIONAL on audit F1"
+
+[dependencies]
+# Consumes ONLY the engine's public Store trait + row types. The engine itself never links libSQL.
+envctl-secrets-engine = { path = "../secrets-engine" }
+anyhow = "1.0"
+serde_json = "1.0"
+# `net` is required for the current-thread reactor's I/O driver (hyper/HTTP transport to sqld);
+# `rt` keeps it single-threaded (no `rt-multi-thread` worker pool). All pure-Rust on Linux.
+tokio = { version = "1.43", features = ["rt", "sync", "time", "net"] }
+tracing = "0.1"
+
+# CANDIDATE A (chosen for the compiling impl): remote-only libSQL client.
+#   - Literal audit-F1 gate (libsql-ffi|libsql-sys|sqlite3-sys) PASSES (core/C-SQLite not pulled).
+#   - BUT pulls libsql-sqlite3-parser -> cc -> compiles lemon.c at build time (NOT C-toolchain-free).
+# CANDIDATE B (libsql-client 0.1 + libsql-hrana 0.1): C-free by design BUT fails to compile in 2026
+#   (worker-macros 0.0.6 / syn 1.0.109 bitrot). Dead end — see README.md.
+libsql = { version = "0.9.30", default-features = false, features = ["remote"] }
+
+[features]
+# `remote` is the ONLY supported wiring (pure HTTP/Hrana, no C-SQLite `core`). `embedded` is a
+# placeholder for a future risk-accepted in-process C-SQLite fallback (NOT implemented here).
+default = ["remote"]
+remote = []
+embedded = []
+
+[package.metadata.docs.rs]
+features = ["remote"]
