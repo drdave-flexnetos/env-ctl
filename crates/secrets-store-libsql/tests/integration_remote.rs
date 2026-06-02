@@ -22,7 +22,7 @@
 
 use envctl_secrets::event::{AuditOutcome, AuditRecord};
 use envctl_secrets::keyslot::{Argon2Params, Factor, Kdf, Keyslot};
-use envctl_secrets::vault::{SecretRow, Store};
+use envctl_secrets::vault::{BearerRow, RemoteClient, SecretRow, Store};
 use envctl_secrets::Provider;
 use envctl_secrets_store_libsql::LibSqlStoreBuilder;
 use serde_json::json;
@@ -140,4 +140,83 @@ fn health_reports_durable_after_init() {
     assert!(h.durable, "a confirmed server-applied barrier => durable");
     assert_eq!(h.schema_version, 1);
     assert!(h.is_healthy());
+}
+
+#[test]
+#[ignore = "requires a running sqld; see module docs for how to run"]
+fn remote_bearer_and_client_roundtrip() {
+    let s = store();
+    let jkt = [0x7Eu8; 32];
+
+    // A REMOTE bearer: client_id + dpop_jkt set, no uid/pid (F15 columns round-trip; the table CHECK
+    // `(client_uid IS NOT NULL) OR (client_id IS NOT NULL)` is satisfied by client_id).
+    let row = BearerRow {
+        token_id: "remtok".into(),
+        policy_id: 1,
+        mac: vec![3; 32],
+        expires_at_ms: 200,
+        issued_at_ms: 100,
+        issued_boottime_ms: 10,
+        client_uid: None,
+        client_pid: None,
+        client_id: Some("phone".into()),
+        dpop_jkt: Some(jkt),
+        revoked: false,
+        row_mac: vec![4; 32],
+    };
+    s.save_bearer(row).unwrap();
+    let got = s.load_bearer("remtok").unwrap().expect("bearer row");
+    assert_eq!(got.client_id.as_deref(), Some("phone"));
+    assert_eq!(got.dpop_jkt, Some(jkt));
+    assert_eq!(got.client_uid, None);
+
+    // remote_clients registry round-trip + revoke.
+    let rc = RemoteClient {
+        client_id: "phone".into(),
+        dpop_jkt: jkt,
+        enabled: true,
+        hardware_bound: false,
+        created_at_ms: 12345,
+        revoked_at_ms: None,
+    };
+    s.save_remote_client(rc).unwrap();
+    let loaded = s.load_remote_client("phone").unwrap().expect("remote client");
+    assert_eq!(loaded.dpop_jkt, jkt);
+    assert!(loaded.enabled);
+    assert!(!loaded.hardware_bound);
+    assert!(s.list_remote_clients().unwrap().iter().any(|c| c.client_id == "phone"));
+
+    assert!(s.revoke_remote_client("phone", 99999).unwrap(), "revoke existing => true");
+    let after = s.load_remote_client("phone").unwrap().expect("still present after revoke");
+    assert!(!after.enabled);
+    assert_eq!(after.revoked_at_ms, Some(99999));
+    assert!(!s.revoke_remote_client("nope", 1).unwrap(), "revoke missing => false");
+}
+
+#[test]
+#[ignore = "requires a running sqld; see module docs for how to run"]
+fn local_bearer_insert_satisfies_check() {
+    // A LOCAL bearer (client_uid set, client_id NULL) must satisfy the relay_bearers CHECK
+    // `(client_uid IS NOT NULL) OR (client_id IS NOT NULL)` — i.e. the F15 CHECK does not break the
+    // existing local-plane insert path.
+    let s = store();
+    let row = BearerRow {
+        token_id: "loctok".into(),
+        policy_id: 2,
+        mac: vec![5; 32],
+        expires_at_ms: 300,
+        issued_at_ms: 150,
+        issued_boottime_ms: 20,
+        client_uid: Some(1000),
+        client_pid: None,
+        client_id: None,
+        dpop_jkt: None,
+        revoked: false,
+        row_mac: vec![6; 32],
+    };
+    s.save_bearer(row).expect("local bearer insert must satisfy the CHECK");
+    let got = s.load_bearer("loctok").unwrap().expect("local bearer row");
+    assert_eq!(got.client_uid, Some(1000));
+    assert_eq!(got.client_id, None);
+    assert_eq!(got.dpop_jkt, None);
 }

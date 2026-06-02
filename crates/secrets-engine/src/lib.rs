@@ -672,15 +672,32 @@ impl Engine {
     /// audited, or emitted. USB possession is proven before any key material is touched (HF-14: the
     /// refusal writes its durable `Refused` row + `GuardRefused` event BEFORE returning). The TTL is
     /// clamped to `<=24h` through the single `clamp_ttl` choke point.
-    pub fn relay_mint(
+    /// Shared mint core for BOTH planes (F12/F15). `binding` selects LOCAL (uid/pid) vs REMOTE
+    /// (client_id + DPoP jkt); everything else — the USB gate, TTL clamp, policy persist, wire MAC,
+    /// plane-bound row MAC, and durable audit — is identical. Public callers: [`Engine::relay_mint`]
+    /// (local) and [`Engine::relay_mint_remote`] (remote).
+    fn mint_bearer_core(
         &self,
         spec: RelayPolicy,
         requested_ttl_secs: i64,
-        peer_uid: Option<u32>,
-        peer_pid: Option<u32>,
+        binding: broker::BearerBinding,
         sink: &EventSink,
     ) -> anyhow::Result<Bearer> {
         let inner = &self.inner;
+        // Destructure the plane binding into the row fields (mutually exclusive by construction:
+        // a LOCAL bearer has uid/pid + no client_id/jkt; a REMOTE bearer has client_id/jkt + no
+        // uid/pid). Both planes are bound into the plane-tagged row MAC below (F12).
+        let (client_uid, client_pid, client_id, dpop_jkt): (
+            Option<u32>,
+            Option<u32>,
+            Option<String>,
+            Option<[u8; 32]>,
+        ) = match binding {
+            broker::BearerBinding::Local { peer_uid, peer_pid } => (peer_uid, peer_pid, None, None),
+            broker::BearerBinding::Remote { client_id, dpop_jkt } => {
+                (None, None, Some(client_id), Some(dpop_jkt))
+            }
+        };
         let now_ms = inner.clock.now().timestamp_millis();
         // Monotonic anchor captured at mint (OI-6): the rollback fence in `decide` measures elapsed
         // lifetime against THIS, not the rewindable wall clock. It is bound into the row MAC.
@@ -693,6 +710,18 @@ impl Engine {
             Some(d) => d,
             None => return Err(EngineError::Locked.into()),
         };
+
+        // PRINCIPAL GATE: a bearer MUST be bound to some principal — a LOCAL peer (uid and/or pid) OR
+        // a REMOTE client_id. Refuse a both-null binding so the two `Store` backends agree (the libSQL
+        // `relay_bearers` CHECK `(client_uid IS NOT NULL) OR (client_id IS NOT NULL)` rejects it; this
+        // refuses it engine-side too, fail-closed, rather than letting InMemStore accept what libSQL
+        // would reject). Unreachable through the peercred-gated daemon (the owner uid is always set),
+        // but guards a direct `relay_mint(None, None)` misuse.
+        if client_uid.is_none() && client_pid.is_none() && client_id.is_none() {
+            drop(v);
+            self.refuse(sink, "relay_mint", &spec.relay_id, "bearer binding has no principal (uid/pid/client_id all absent)")?;
+            anyhow::bail!("relay_mint refused: binding has neither a local peer nor a remote client_id");
+        }
 
         // USB-GATE (HF-14): prove possession of the keyfile backing an enabled USB keyslot BEFORE
         // touching any key material. A UUID match alone is not possession (CF-4) — `keyfile_for`
@@ -756,8 +785,10 @@ impl Engine {
                 expires_at_ms,
                 now_ms,
                 issued_boottime_ms,
-                peer_uid,
-                peer_pid,
+                client_uid,
+                client_pid,
+                client_id.as_deref(),
+                dpop_jkt.as_ref(),
                 false,
             ),
         );
@@ -770,8 +801,10 @@ impl Engine {
             expires_at_ms,
             issued_at_ms: now_ms,
             issued_boottime_ms,
-            client_uid: peer_uid,
-            client_pid: peer_pid,
+            client_uid,
+            client_pid,
+            client_id,
+            dpop_jkt,
             revoked: false,
             row_mac: row_mac.to_vec(),
         })?;
@@ -805,6 +838,101 @@ impl Engine {
             expires_at,
         })
     }
+
+    /// Mint a LOCAL (uid/pid-bound) relay bearer over the control plane (HF-8). Public API unchanged;
+    /// delegates to [`Engine::mint_bearer_core`] with a `Local` binding.
+    pub fn relay_mint(
+        &self,
+        spec: RelayPolicy,
+        requested_ttl_secs: i64,
+        peer_uid: Option<u32>,
+        peer_pid: Option<u32>,
+        sink: &EventSink,
+    ) -> anyhow::Result<Bearer> {
+        self.mint_bearer_core(
+            spec,
+            requested_ttl_secs,
+            broker::BearerBinding::Local { peer_uid, peer_pid },
+            sink,
+        )
+    }
+
+    /// Register (or re-register) a remote client for the Phase-8 relay edge (F15). USB-gated like a
+    /// mint: only the operator in physical possession may enroll a remote principal. Stores the
+    /// client's DPoP public-key thumbprint (`dpop_jkt`, RFC 7638) + the `hardware_bound` attestation
+    /// — `false` means the binding is bearer-only (replay-BOUNDED by scope/TTL, not replay-PREVENTED;
+    /// audit F20/OI-SM-5). Idempotent (upsert by `client_id`). Refuses an empty `client_id`.
+    pub fn register_remote_client(
+        &self,
+        client_id: String,
+        dpop_jkt: [u8; 32],
+        hardware_bound: bool,
+        sink: &EventSink,
+    ) -> anyhow::Result<()> {
+        if client_id.trim().is_empty() {
+            anyhow::bail!("register_remote_client refused: empty client_id");
+        }
+        let inner = &self.inner;
+        let now_ms = inner.clock.now().timestamp_millis();
+        // USB possession (operator gate), same as mint — registering a remote principal is privileged.
+        if !self.usb_possession_proven()? {
+            self.refuse(sink, "register_remote_client", &client_id, "usb possession not proven")?;
+            return Err(EngineError::UsbAbsent.into());
+        }
+        inner.store.save_remote_client(crate::vault::RemoteClient {
+            client_id: client_id.clone(),
+            dpop_jkt,
+            enabled: true,
+            hardware_bound,
+            created_at_ms: now_ms,
+            revoked_at_ms: None,
+        })?;
+        self.audit_ok(
+            sink,
+            "remote_client_registered",
+            Some(client_id),
+            serde_json::json!({ "hardware_bound": hardware_bound }),
+        )?;
+        Ok(())
+    }
+
+    /// Mint a REMOTE (client_id + DPoP-jkt-bound) relay bearer (Phase 8, F15). The client MUST be a
+    /// registered, enabled remote client whose registered DPoP thumbprint equals `dpop_jkt`
+    /// (proof-of-possession is bound at mint; the edge re-verifies the live per-request proof). Like
+    /// every mint it is USB-gated (push-mint). Refuses (no bearer, durable Refused row) on an
+    /// unknown/disabled/revoked client or a jkt mismatch — default-deny.
+    pub fn relay_mint_remote(
+        &self,
+        spec: RelayPolicy,
+        requested_ttl_secs: i64,
+        client_id: String,
+        dpop_jkt: [u8; 32],
+        sink: &EventSink,
+    ) -> anyhow::Result<Bearer> {
+        // Validate the registration BEFORE any key material (default-deny; no DEK needed for this).
+        // The `dpop_jkt` is a PUBLIC RFC-7638 thumbprint (not a secret) and this path is USB-gated +
+        // operator-only, so a plain `==` is intentional (no constant-time comparison needed — unlike
+        // the secret wire/row MACs).
+        let registered = self.inner.store.load_remote_client(&client_id)?;
+        match registered {
+            Some(c) if c.enabled && c.revoked_at_ms.is_none() && c.dpop_jkt == dpop_jkt => {}
+            Some(_) => {
+                self.refuse(sink, "relay_mint_remote", &spec.relay_id, "remote client disabled/revoked or jkt mismatch")?;
+                anyhow::bail!("relay_mint_remote refused: client not enabled, or DPoP jkt does not match registration");
+            }
+            None => {
+                self.refuse(sink, "relay_mint_remote", &spec.relay_id, "unknown remote client")?;
+                anyhow::bail!("relay_mint_remote refused: client {client_id:?} is not registered");
+            }
+        }
+        self.mint_bearer_core(
+            spec,
+            requested_ttl_secs,
+            broker::BearerBinding::Remote { client_id, dpop_jkt },
+            sink,
+        )
+    }
+
     /// Fail-closed; returns the count of bearers/policies flipped (HF-16). When `apply`, the relay
     /// policy is marked `revoked` AND every live bearer hanging off it is revoked; a store error is
     /// an `Err` (the revoke must NOT silently no-op). When `!apply` (dry-run) the count that WOULD be
@@ -1091,6 +1219,8 @@ impl Engine {
             row.issued_boottime_ms,
             row.client_uid,
             row.client_pid,
+            row.client_id.as_deref(),
+            row.dpop_jkt.as_ref(),
             row.revoked,
         );
         if !verify_bearer_row(&row_mac_key, &row_msg, &row.row_mac) {
@@ -1138,12 +1268,12 @@ impl Engine {
             issued_boottime_ms: row.issued_boottime_ms,
             client_uid: row.client_uid,
             client_pid: row.client_pid,
-            // Local-plane bearers carry no remote binding. The Phase-8 edge populates these from the
-            // persisted remote binding (client_id/dpop_jkt — F15 schema) when it lands; until then
-            // this control path mints/serves only local (uid/pid) bearers, so `decide()`'s remote
-            // clause treats every bearer here as local (no cross-kind, no DPoP requirement).
-            client_id: None,
-            dpop_jkt: None,
+            // The remote binding (F15) read from the authenticated row: `None` for a local bearer,
+            // `Some(..)` for one minted via `relay_mint_remote`. The row MAC above (F12) authenticated
+            // these, so `decide()`'s remote clause acts on trusted fields — a remote bearer presented
+            // over this local UDS path (req.remote == None) is denied CrossKindPresentation.
+            client_id: row.client_id.clone(),
+            dpop_jkt: row.dpop_jkt,
             revoked: row.revoked,
         };
         let canon = CanonRequest {
@@ -1255,6 +1385,8 @@ impl Engine {
                 row.issued_boottime_ms,
                 row.client_uid,
                 row.client_pid,
+                row.client_id.as_deref(),
+                row.dpop_jkt.as_ref(),
                 row.revoked,
             ),
         )

@@ -68,6 +68,13 @@ pub struct BearerRow {
     pub issued_boottime_ms: i64,
     pub client_uid: Option<u32>,
     pub client_pid: Option<u32>,
+    /// Remote binding (Phase 8, F15): the registered remote client this bearer is bound to, and the
+    /// DPoP public-key thumbprint (RFC 7638) it must prove possession of. `None` for a local uid/pid
+    /// bearer. A bearer is REMOTE iff `client_id.is_some()` (the planes are mutually exclusive). BOTH
+    /// are bound into `row_mac` via the plane-tagged `bearer_row_mac_message` (F12), so a store-level
+    /// tamper that adds/swaps them — or flips a local row to remote — fails the row MAC, closed.
+    pub client_id: Option<String>,
+    pub dpop_jkt: Option<[u8; 32]>,
     pub revoked: bool,
     /// DEK-keyed MAC over `bearer_row_mac_message(..)` of the fields above. Authenticates the
     /// clear-text row state so a store-level tamper cannot forge an `Allow`.
@@ -80,6 +87,23 @@ pub struct CertRow {
     pub cn: String,
     pub not_after: String,
     pub der: Vec<u8>,
+}
+
+/// A registered remote client (Phase 8, F15): the principal a remote bearer can be bound to. The
+/// edge authenticates a presented `client_id` against this registry (enabled + the registered DPoP
+/// key) before a swap. `hardware_bound` records whether the operator attested a NON-extractable key
+/// store (OI-SM-5 / audit F20): `false` means the binding is bearer-only — replay-BOUNDED by
+/// scope/TTL, not replay-PREVENTED — and swaps should be tagged accordingly. The registry holds NO
+/// secret (the jkt is a public-key thumbprint), so it is non-secret metadata like the other rows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteClient {
+    pub client_id: String,
+    /// RFC 7638 JWK SHA-256 thumbprint of the client's registered DPoP public key.
+    pub dpop_jkt: [u8; 32],
+    pub enabled: bool,
+    pub hardware_bound: bool,
+    pub created_at_ms: i64,
+    pub revoked_at_ms: Option<i64>,
 }
 
 /// The vault's persistence surface. Encryption happens ABOVE this trait — a `Store` only ever
@@ -148,8 +172,30 @@ pub trait Store: Send + Sync {
     fn list_bearers_for_relay(&self, _relay_id: &str) -> anyhow::Result<Vec<BearerRow>> {
         Ok(Vec::new())
     }
+    /// WARNING: this flips `revoked` WITHOUT recomputing the DEK-keyed `row_mac`, so a bearer revoked
+    /// via this method will FAIL its row-MAC verify on the next swap (denied as `UnknownBearer` —
+    /// fail-closed, and a revoked bearer denies anyway). The engine therefore does NOT use it for the
+    /// authoritative revoke: `relay_revoke` reseals each bearer's row MAC individually (DEK live). A
+    /// future caller wanting a relay-wide revoke MUST reseal the row MAC of every flipped row, or the
+    /// rows become unauthenticated.
     fn revoke_bearers_for_relay(&self, _relay_id: &str) -> anyhow::Result<u32> {
         Ok(0)
+    }
+
+    // ---- remote clients (Phase 8, F15; minimal stubs in 1b) ----
+    /// Upsert a registered remote client by `client_id`.
+    fn save_remote_client(&self, _row: RemoteClient) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn load_remote_client(&self, _client_id: &str) -> anyhow::Result<Option<RemoteClient>> {
+        Ok(None)
+    }
+    fn list_remote_clients(&self) -> anyhow::Result<Vec<RemoteClient>> {
+        Ok(Vec::new())
+    }
+    /// Mark a client revoked (set `revoked_at_ms`, `enabled=false`). Returns true iff it existed.
+    fn revoke_remote_client(&self, _client_id: &str, _now_ms: i64) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     // ---- ca / certs (minimal stubs in 1b) ----
@@ -182,6 +228,7 @@ struct InMemData {
     next_secret_row_id: i64, // high-water mark of reserved row_ids (monotonic)
     relays: Vec<RelayPolicyRow>,
     bearers: Vec<BearerRow>,
+    remote_clients: Vec<RemoteClient>,
     certs: Vec<CertRow>,
 }
 
@@ -461,6 +508,49 @@ impl Store for InMemStore {
             }
         }
         Ok(n)
+    }
+
+    fn save_remote_client(&self, row: RemoteClient) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        if let Some(existing) = g
+            .remote_clients
+            .iter_mut()
+            .find(|c| c.client_id == row.client_id)
+        {
+            *existing = row;
+        } else {
+            g.remote_clients.push(row);
+        }
+        Ok(())
+    }
+
+    fn load_remote_client(&self, client_id: &str) -> anyhow::Result<Option<RemoteClient>> {
+        let g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(g
+            .remote_clients
+            .iter()
+            .find(|c| c.client_id == client_id)
+            .cloned())
+    }
+
+    fn list_remote_clients(&self) -> anyhow::Result<Vec<RemoteClient>> {
+        let g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        Ok(g.remote_clients.clone())
+    }
+
+    fn revoke_remote_client(&self, client_id: &str, now_ms: i64) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        if let Some(c) = g
+            .remote_clients
+            .iter_mut()
+            .find(|c| c.client_id == client_id)
+        {
+            c.enabled = false;
+            c.revoked_at_ms = Some(now_ms);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn save_cert(&self, row: CertRow) -> anyhow::Result<()> {

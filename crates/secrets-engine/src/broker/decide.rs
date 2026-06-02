@@ -67,9 +67,9 @@ pub struct RemotePeer {
 }
 
 /// A bearer that has already been looked up + constant-time verified against the store — BOTH the
-/// wire MAC AND the DEK-keyed row MAC (so every field below is authenticated, not clear-text) —
-/// EXCEPT the Phase-8 remote fields `client_id`/`dpop_jkt`, which the current row MAC does NOT yet
-/// cover and which are always `None` (and never read from the store) until F12/F15 land (see below).
+/// wire MAC AND the DEK-keyed, PLANE-TAGGED row MAC (so every field below is authenticated, not
+/// clear-text; the row MAC covers `client_id`/`dpop_jkt` and a kind discriminator, F12, so a
+/// store-level cross-plane tamper fails closed before `decide()`).
 pub struct VerifiedBearer {
     pub policy_id: i64,
     pub token_id: String,
@@ -79,15 +79,14 @@ pub struct VerifiedBearer {
     pub issued_boottime_ms: i64,
     pub client_uid: Option<u32>,
     pub client_pid: Option<u32>,
-    /// Remote binding (Phase 8): the registered remote client this bearer is bound to. `None` for a
-    /// local uid/pid bearer. A bearer is REMOTE iff `client_id.is_some()` — the two planes are
-    /// mutually exclusive by construction (mint binds exactly one). NOT YET row-MAC-authenticated:
-    /// the plane-bound MAC (audit F12) + the schema column (F15) are deferred, so until they land
-    /// this field is always `None` at the sole construction site and never sourced from the store.
-    /// (When F15's `register-remote`/mint lands it MUST forbid an empty/blank `client_id`.)
+    /// Remote binding (Phase 8, F15): the registered remote client this bearer is bound to. `None`
+    /// for a local uid/pid bearer. A bearer is REMOTE iff `client_id.is_some()` — the two planes are
+    /// mutually exclusive by construction (`mint_bearer_core` binds exactly one). Populated by
+    /// `relay_mint_remote`; authenticated by the plane-tagged row MAC (F12). `register_remote_client`
+    /// forbids an empty/blank `client_id`, so the equality binding check can never match on `""`.
     pub client_id: Option<String>,
     /// The DPoP public-key thumbprint (RFC 7638) the remote bearer is bound to. `None` for local.
-    /// Same F12/F15 deferral as `client_id`: not yet row-MAC-covered; `None` until the edge wiring lands.
+    /// Authenticated by the row MAC alongside `client_id` (F12).
     pub dpop_jkt: Option<[u8; 32]>,
     pub revoked: bool,
 }

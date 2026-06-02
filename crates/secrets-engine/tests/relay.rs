@@ -326,6 +326,24 @@ impl Store for SharedStore {
     fn revoke_bearers_for_relay(&self, relay_id: &str) -> anyhow::Result<u32> {
         self.0.revoke_bearers_for_relay(relay_id)
     }
+    fn save_remote_client(
+        &self,
+        row: envctl_secrets::vault::RemoteClient,
+    ) -> anyhow::Result<()> {
+        self.0.save_remote_client(row)
+    }
+    fn load_remote_client(
+        &self,
+        client_id: &str,
+    ) -> anyhow::Result<Option<envctl_secrets::vault::RemoteClient>> {
+        self.0.load_remote_client(client_id)
+    }
+    fn list_remote_clients(&self) -> anyhow::Result<Vec<envctl_secrets::vault::RemoteClient>> {
+        self.0.list_remote_clients()
+    }
+    fn revoke_remote_client(&self, client_id: &str, now_ms: i64) -> anyhow::Result<bool> {
+        self.0.revoke_remote_client(client_id, now_ms)
+    }
 }
 
 // ---- B. relay_mint clamp + USB gate ----------------------------------------------------------
@@ -531,6 +549,108 @@ fn relay_swap_allow_delivers_real_key_only_to_upstream() {
             SecretEvent::RelaySwapped { allowed: true, token_id, .. } if *token_id == bearer.token_id
         )),
         "a RelaySwapped{{allowed:true}} event must be emitted carrying only the token_id"
+    );
+}
+
+/// Phase-8 F15/F12: `register_remote_client` + `relay_mint_remote` bind a bearer to a client_id +
+/// DPoP jkt (NOT a uid/pid), persist them, authenticate them in the row MAC, and `decide()` denies
+/// that remote bearer when it is presented over the LOCAL egress path (cross-kind).
+#[test]
+fn relay_mint_remote_binds_client_and_cross_kind_denied_locally() {
+    let inmem = Arc::new(InMemStore::new());
+    let clock = FakeClock::new(T0);
+    let cap = CapturingUpstream(Arc::new(Mutex::new(None)));
+    let eng = engine(
+        Box::new(SharedStore(inmem.clone())),
+        clock.clone(),
+        Box::new(AbsentUsb),
+        cap.clone(),
+    );
+    let (sink, rx) = EventSink::channel();
+    eng.init_vault(pp("remote-pass"), None, None, at_floor(), &sink).unwrap();
+    eng.unlock(Unlock::Passphrase(pp("remote-pass")), &sink).unwrap();
+    eng.secret_put(
+        SecretMeta {
+            name: "anthropic_key".to_string(),
+            provider: Provider::Anthropic,
+            note: String::new(),
+            broker_only: true,
+        },
+        Zeroizing::new(b"sk-REAL-REMOTE".to_vec()),
+        &sink,
+    )
+    .unwrap();
+
+    let jkt = [0x42u8; 32];
+
+    // An UNKNOWN remote client cannot be minted against (default-deny).
+    assert!(
+        eng.relay_mint_remote(anthropic_policy("anthropic_key"), 3600, "phone".to_string(), jkt, &sink)
+            .is_err(),
+        "minting against an unregistered client must refuse"
+    );
+
+    // Register, then mint binds the bearer to (client_id, jkt).
+    eng.register_remote_client("phone".to_string(), jkt, false, &sink)
+        .expect("register remote client");
+    let bearer = eng
+        .relay_mint_remote(anthropic_policy("anthropic_key"), 3600, "phone".to_string(), jkt, &sink)
+        .expect("remote mint");
+    let _ = drain(&rx);
+
+    // The persisted row carries the remote binding (F15) and NO local uid/pid.
+    let row = inmem.load_bearer(&bearer.token_id).unwrap().expect("bearer row persisted");
+    assert_eq!(row.client_id.as_deref(), Some("phone"));
+    assert_eq!(row.dpop_jkt, Some(jkt));
+    assert_eq!(row.client_uid, None);
+    assert_eq!(row.client_pid, None);
+
+    // A jkt that does not match the registration is refused at mint (proof-of-possession binding).
+    assert!(
+        eng.relay_mint_remote(anthropic_policy("anthropic_key"), 3600, "phone".to_string(), [0x99u8; 32], &sink)
+            .is_err(),
+        "minting with a jkt != the registered key must refuse"
+    );
+
+    // Presenting the REMOTE bearer over the LOCAL egress path (req.remote == None) is DENIED
+    // cross-kind. Reaching CrossKindPresentation (NOT UnknownBearer) proves the row MAC over
+    // client_id/dpop_jkt verified; the real key is never fetched.
+    let outcome = block_on(eng.relay_swap(&bearer.raw, &post_req(Some(1000)), &sink));
+    match outcome {
+        SwapOutcome::Denied(DenyReason::CrossKindPresentation) => {}
+        other => panic!("expected Denied(CrossKindPresentation), got {:?}", outcome_kind(&other)),
+    }
+    assert!(
+        cap.0.lock().unwrap().is_none(),
+        "the real key must NOT be fetched for a cross-kind deny"
+    );
+}
+
+/// A mint with NO principal at all (local uid AND pid both None, no remote client) is refused, so
+/// the InMemStore and the libSQL CHECK can never disagree on a both-null bearer (fail-closed).
+#[test]
+fn relay_mint_both_null_principal_refused() {
+    let inmem = Arc::new(InMemStore::new());
+    let clock = FakeClock::new(T0);
+    let cap = CapturingUpstream(Arc::new(Mutex::new(None)));
+    let eng = engine(
+        Box::new(SharedStore(inmem.clone())),
+        clock.clone(),
+        Box::new(AbsentUsb),
+        cap.clone(),
+    );
+    let (sink, _rx) = EventSink::channel();
+    eng.init_vault(pp("nul"), None, None, at_floor(), &sink).unwrap();
+    eng.unlock(Unlock::Passphrase(pp("nul")), &sink).unwrap();
+
+    assert!(
+        eng.relay_mint(anthropic_policy("anthropic_key"), 3600, None, None, &sink)
+            .is_err(),
+        "a both-null-principal mint must be refused"
+    );
+    assert!(
+        inmem.list_bearers_for_relay("claude-main").unwrap().is_empty(),
+        "no bearer is persisted on a refused mint"
     );
 }
 

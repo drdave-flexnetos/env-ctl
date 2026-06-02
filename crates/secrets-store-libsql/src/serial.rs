@@ -8,7 +8,7 @@
 
 use envctl_secrets::event::{AuditOutcome, AuditRecord};
 use envctl_secrets::keyslot::{Kdf, Keyslot};
-use envctl_secrets::vault::{BearerRow, CertRow, RelayPolicyRow, SecretRow};
+use envctl_secrets::vault::{BearerRow, CertRow, RelayPolicyRow, RemoteClient, SecretRow};
 use envctl_secrets::{Factor, Provider, RelayPolicy};
 use libsql::{Row, Value};
 
@@ -47,6 +47,22 @@ fn get_opt_string(row: &Row, idx: i32, ctx: &str) -> Result<Option<String>> {
         Value::Text(s) => Ok(Some(s)),
         other => Err(ser(ctx, format!("expected TEXT/NULL, got {other:?}"))),
     }
+}
+
+/// A column that is `BLOB` or SQL `NULL` -> `Option<Vec<u8>>`.
+fn get_opt_blob(row: &Row, idx: i32, ctx: &str) -> Result<Option<Vec<u8>>> {
+    match row.get_value(idx).map_err(|e| ser(ctx, e))? {
+        Value::Null => Ok(None),
+        Value::Blob(b) => Ok(Some(b)),
+        other => Err(ser(ctx, format!("expected BLOB/NULL, got {other:?}"))),
+    }
+}
+
+/// Coerce a stored blob into a fixed 32-byte DPoP jkt, rejecting a wrong length (a tamper/corruption
+/// would otherwise silently truncate or mis-bind).
+fn jkt_from_vec(v: Vec<u8>, ctx: &str) -> Result<[u8; 32]> {
+    <[u8; 32]>::try_from(v.as_slice())
+        .map_err(|_| ser(ctx, format!("expected 32-byte jkt, got {} bytes", v.len())))
 }
 
 // ---- enum <-> wire-string helpers (serde snake_case is the canonical wire form) ----
@@ -276,11 +292,20 @@ pub fn bind_bearer_row(row: &BearerRow) -> Vec<Value> {
         },
         Value::Integer(row.revoked as i64),
         Value::Blob(row.row_mac.clone()),
+        // F15 remote-binding cols (10/11): NULL for a local bearer.
+        match &row.client_id {
+            Some(c) => Value::Text(c.clone()),
+            None => Value::Null,
+        },
+        match row.dpop_jkt {
+            Some(j) => Value::Blob(j.to_vec()),
+            None => Value::Null,
+        },
     ]
 }
 
 /// Cols: 0 token_id, 1 policy_id, 2 mac, 3 expires_at_ms, 4 issued_at_ms, 5 issued_boottime_ms,
-/// 6 client_uid, 7 client_pid, 8 revoked, 9 row_mac.
+/// 6 client_uid, 7 client_pid, 8 revoked, 9 row_mac, 10 client_id, 11 dpop_jkt.
 pub fn deserialize_bearer_row(row: &Row) -> Result<BearerRow> {
     Ok(BearerRow {
         token_id: get_string(row, 0, "bearer.token_id")?,
@@ -293,6 +318,41 @@ pub fn deserialize_bearer_row(row: &Row) -> Result<BearerRow> {
         client_pid: get_opt_i64(row, 7, "bearer.client_pid")?.map(|p| p as u32),
         revoked: get_i64(row, 8, "bearer.revoked")? != 0,
         row_mac: get_blob(row, 9, "bearer.row_mac")?,
+        client_id: get_opt_string(row, 10, "bearer.client_id")?,
+        dpop_jkt: get_opt_blob(row, 11, "bearer.dpop_jkt")?
+            .map(|v| jkt_from_vec(v, "bearer.dpop_jkt"))
+            .transpose()?,
+    })
+}
+
+// =====================================================================================
+// RemoteClient (Phase 8, F15)
+// =====================================================================================
+
+/// Positional params for `schema::SAVE_REMOTE_CLIENT`.
+pub fn bind_remote_client(row: &RemoteClient) -> Vec<Value> {
+    vec![
+        Value::Text(row.client_id.clone()),
+        Value::Blob(row.dpop_jkt.to_vec()),
+        Value::Integer(row.enabled as i64),
+        Value::Integer(row.hardware_bound as i64),
+        Value::Integer(row.created_at_ms),
+        match row.revoked_at_ms {
+            Some(t) => Value::Integer(t),
+            None => Value::Null,
+        },
+    ]
+}
+
+/// Cols: 0 client_id, 1 dpop_jkt, 2 enabled, 3 hardware_bound, 4 created_at_ms, 5 revoked_at_ms.
+pub fn deserialize_remote_client(row: &Row) -> Result<RemoteClient> {
+    Ok(RemoteClient {
+        client_id: get_string(row, 0, "remote_client.client_id")?,
+        dpop_jkt: jkt_from_vec(get_blob(row, 1, "remote_client.dpop_jkt")?, "remote_client.dpop_jkt")?,
+        enabled: get_i64(row, 2, "remote_client.enabled")? != 0,
+        hardware_bound: get_i64(row, 3, "remote_client.hardware_bound")? != 0,
+        created_at_ms: get_i64(row, 4, "remote_client.created_at_ms")?,
+        revoked_at_ms: get_opt_i64(row, 5, "remote_client.revoked_at_ms")?,
     })
 }
 

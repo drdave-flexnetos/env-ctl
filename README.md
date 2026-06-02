@@ -42,7 +42,7 @@ The **entire security-critical engine is built, independently audited, and green
 | **Local daemon** — `secretd` tonic gRPC over a Unix socket, `SO_PEERCRED` owner-only, engine-bridged Lock/Vault/Relay/Audit services + event streaming | ✅ e2e |
 | **CLI** — `secretctl` (the `env-ctl` verbs) over the UDS, pretty + `--json` | ✅ |
 
-**117 tests pass** (`cargo test --workspace`; the libSQL store's 5 integration tests and the
+**130 tests pass** (`cargo test --workspace`; the libSQL store's 5 integration tests and the
 engine-over-libSQL durability e2e are `#[ignore]`d — they need a running sqld); the engine is
 **pure-Rust, C-free, async-free** (no C *library* in the trust boundary — `ci/gates/no-c.sh` proves
 it); everything compiles on stable. Two independent multi-agent security audits (Phase-1 crypto+vault,
@@ -82,7 +82,7 @@ docs/   ARCHITECTURE · DESIGN-NOTES · ROADMAP · THREAT-MODEL · SERVER-MODE �
 
 ```bash
 cargo build --workspace
-cargo test  --workspace          # 117 passing (libSQL sqld-backed tests are #[ignore]d)
+cargo test  --workspace          # 130 passing (libSQL sqld-backed tests are #[ignore]d)
 bash ci/gates/no-c.sh            # no C *library* in the trust boundary; one ring-only rustls
 cargo test -p envctl-secrets-engine   # crypto/vault/broker unit + integration tests
 # CI gates: engine is C-free + async-free, exactly one rustls on the ring path (no aws-lc).

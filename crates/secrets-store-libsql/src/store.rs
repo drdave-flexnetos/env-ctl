@@ -8,7 +8,9 @@
 
 use envctl_secrets::event::AuditRecord;
 use envctl_secrets::keyslot::Keyslot;
-use envctl_secrets::vault::{audit, BearerRow, CertRow, RelayPolicyRow, SecretRow, Store};
+use envctl_secrets::vault::{
+    audit, BearerRow, CertRow, RelayPolicyRow, RemoteClient, SecretRow, Store,
+};
 use libsql::Value;
 
 use crate::error::Error;
@@ -463,6 +465,43 @@ impl Store for LibSqlStore {
             .execute(schema::REVOKE_BEARERS_FOR_RELAY, vec![Value::Text(relay_id.to_string())])?;
         self.fsync_barrier()?;
         Ok(n as u32)
+    }
+
+    // ---- remote clients (Phase 8, F15) ----
+
+    fn save_remote_client(&self, row: RemoteClient) -> anyhow::Result<()> {
+        self.conn
+            .execute(schema::SAVE_REMOTE_CLIENT, serial::bind_remote_client(&row))?;
+        self.fsync_barrier()?;
+        Ok(())
+    }
+
+    fn load_remote_client(&self, client_id: &str) -> anyhow::Result<Option<RemoteClient>> {
+        let row = self
+            .conn
+            .query_one(schema::LOAD_REMOTE_CLIENT, vec![Value::Text(client_id.to_string())])?;
+        match row {
+            Some(r) => Ok(Some(serial::deserialize_remote_client(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_remote_clients(&self) -> anyhow::Result<Vec<RemoteClient>> {
+        let rows = self.conn.query_all(schema::LIST_REMOTE_CLIENTS, Vec::new())?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(serial::deserialize_remote_client(r)?);
+        }
+        Ok(out)
+    }
+
+    fn revoke_remote_client(&self, client_id: &str, now_ms: i64) -> anyhow::Result<bool> {
+        let n = self.conn.execute(
+            schema::REVOKE_REMOTE_CLIENT,
+            vec![Value::Integer(now_ms), Value::Text(client_id.to_string())],
+        )?;
+        self.fsync_barrier()?;
+        Ok(n > 0)
     }
 
     // ---- ca / certs ----

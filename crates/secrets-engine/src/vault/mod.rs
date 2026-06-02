@@ -6,7 +6,7 @@ pub mod crypto;
 pub mod store;
 
 pub use store::{
-    BearerRow, CertRow, InMemStore, RelayPolicyRow, SecretRow, Store,
+    BearerRow, CertRow, InMemStore, RelayPolicyRow, RemoteClient, SecretRow, Store,
 };
 
 /// Vault state. `Unlocked` holds the live DEK (zeroized on drop / on `lock`).

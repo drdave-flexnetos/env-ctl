@@ -124,15 +124,40 @@ fn bind_bearer_row_null_peer_fields() {
         issued_boottime_ms: 10,
         client_uid: None,
         client_pid: Some(4242),
+        client_id: None,
+        dpop_jkt: None,
         revoked: false,
         row_mac: vec![2; 32],
     };
     let v = serial::bind_bearer_row(&row);
-    assert_eq!(v.len(), 10);
+    assert_eq!(v.len(), 12);
     assert!(matches!(&v[0], Value::Text(s) if s == "tok"));
     assert!(matches!(v[6], Value::Null), "absent client_uid -> NULL");
     assert!(matches!(v[7], Value::Integer(4242)));
     assert!(matches!(v[8], Value::Integer(0)), "revoked false -> 0");
+    assert!(matches!(v[10], Value::Null), "local bearer client_id -> NULL");
+    assert!(matches!(v[11], Value::Null), "local bearer dpop_jkt -> NULL");
+}
+
+#[test]
+fn bind_remote_client_shape() {
+    use envctl_secrets::vault::RemoteClient;
+    let row = RemoteClient {
+        client_id: "phone".into(),
+        dpop_jkt: [0xAB; 32],
+        enabled: true,
+        hardware_bound: false,
+        created_at_ms: 1234,
+        revoked_at_ms: None,
+    };
+    let v = serial::bind_remote_client(&row);
+    assert_eq!(v.len(), 6);
+    assert!(matches!(&v[0], Value::Text(s) if s == "phone"));
+    assert!(matches!(&v[1], Value::Blob(b) if b.len() == 32));
+    assert!(matches!(v[2], Value::Integer(1)), "enabled true -> 1");
+    assert!(matches!(v[3], Value::Integer(0)), "hardware_bound false -> 0");
+    assert!(matches!(v[4], Value::Integer(1234)));
+    assert!(matches!(v[5], Value::Null), "no revoked_at_ms -> NULL");
 }
 
 #[test]

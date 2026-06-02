@@ -12,7 +12,7 @@ daemon; per-client **relay bearers** (≤24h, scoped, peer-bound, revocable, USB
 the real key at egress. Pull the USB = physical kill switch.
 
 ## State (as of this handoff)
-**Core complete, twice-audited, locally runnable. 117 tests green; stable Rust; no C *library* in the
+**Core complete, twice-audited, locally runnable. 130 tests green; stable Rust; no C *library* in the
 trust boundary.** All pushed. **OI-1 RESOLVED (a):** the libSQL `remote` store crate is now a
 workspace member (build-time `cc` accepted — it is already required by ring+blake3; no C *library* is
 linked), with the no-C / single-ring-backend gate materialized + armed at `ci/gates/no-c.sh`.
@@ -33,7 +33,7 @@ linked), with the no-C / single-ring-backend gate materialized + armed at `ci/ga
    toolchain** — verified empirically that the engine ALREADY needs `cc` via **ring** (compiles
    C/asm) **and blake3** (SIMD), so the upheld tenet is *"no C **library** linked in the trust
    boundary"* — proven by `ci/gates/no-c.sh` (no `libsql-ffi`/`libsql-sys`/`sqlite3-sys`, no
-   `aws-lc-*`/`openssl-sys`, exactly one ring-only `rustls`). Workspace builds + **117 tests green**;
+   `aws-lc-*`/`openssl-sys`, exactly one ring-only `rustls`). Workspace builds + **130 tests green**;
    5 sqld integration tests `#[ignore]`d. `lemon.c` is build-time codegen (emits Rust; nothing C
    linked). **Phase-1 wiring — DONE. ✅** `secretd` runtime-selects the backend via config (env >
    `secretd.toml` > inmem default; see `docs/ops/08-secretd-store-config.md`); `Engine::open_with_store`
@@ -57,12 +57,19 @@ linked), with the no-C / single-ring-backend gate materialized + armed at `ci/ga
    `RemoteClientRevoked`). 8 new table tests; local plane 100% preserved (`decide()` is pure +
    forward-compatible — local construction sets the remote fields `None`). Audit F1 (the libSQL
    "VERIFIED pure-Rust" doc defect) is also resolved: SERVER-MODE §2.2 now says PROVEN-by-gate, backed
-   by the real `ci/gates/no-c.sh` Gate 3a. **Remaining Phase-8 increments (SERVER-MODE audit is the
-   spec):** F2 in-process TLS+DPoP/EKM listener (`crates/secretd/src/edge`, the only thing that
-   *serves*), F15 schema columns (`client_id`/`dpop_jkt`/`kind` + `remote_clients`) + mint/swap wiring,
-   F12 plane-bound row MAC, F6 bounded jti replay store, F5 streaming revocation tear-down, F14
-   PresenceGate trait (Phase-0 refactor, unblocks VPS), F7–F9 VPS Profile-B gates. The listener MUST
-   NOT serve until F15/F12 wire the remote fields through mint/store. Control plane stays local-UDS-only.
+   by the real `ci/gates/no-c.sh` Gate 3a. **F12 + F15 are now DONE too:** the bearer ROW MAC is
+   plane-tagged (kind byte + `client_id` + `dpop_jkt`, so a cross-plane store tamper fails the MAC,
+   not just the `decide()` clause); `BearerRow` carries the binding fields; a `remote_clients`
+   registry + `register_remote_client` (USB-gated) + `relay_mint_remote` (validates a
+   registered/enabled client + jkt proof-of-possession) make remote bearers mintable; `relay_swap`
+   reads the authenticated fields; the libSQL store persists the new columns + table. Engine + real-
+   sqld round-trip tests; both Store backends agree (a both-null binding is refused engine-side to
+   match the libSQL CHECK). **Remaining Phase-8 increment (SERVER-MODE audit is the spec) — now
+   UNBLOCKED:** F2 the in-process TLS+DPoP/EKM listener (`crates/secretd/src/edge`, the only thing
+   that *serves* — it builds `CanonRequest.remote` from a verified DPoP proof + TLS channel binding
+   and calls the now-proven `relay_mint_remote`/`decide()` path). Then F6 bounded jti replay store,
+   F5 streaming revocation tear-down, F14 PresenceGate trait (unblocks VPS), F7–F9 VPS Profile-B
+   gates. Control plane stays local-UDS-only.
 3. **Merge into envctl** — see "Merge workflow" below.
 
 ---

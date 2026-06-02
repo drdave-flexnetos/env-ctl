@@ -76,7 +76,18 @@ CREATE TABLE IF NOT EXISTS relay_bearers (
   client_uid         INTEGER,
   client_pid         INTEGER,
   revoked            INTEGER NOT NULL,
-  row_mac            BLOB NOT NULL
+  row_mac            BLOB NOT NULL,
+  client_id          TEXT,
+  dpop_jkt           BLOB,
+  CHECK ((client_uid IS NOT NULL) OR (client_id IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS remote_clients (
+  client_id      TEXT PRIMARY KEY,
+  dpop_jkt       BLOB NOT NULL,
+  enabled        INTEGER NOT NULL,
+  hardware_bound INTEGER NOT NULL,
+  created_at_ms  INTEGER NOT NULL,
+  revoked_at_ms  INTEGER
 );
 CREATE TABLE IF NOT EXISTS certs (
   serial     TEXT PRIMARY KEY,
@@ -159,21 +170,36 @@ pub const LIST_RELAY_POLICIES: &str =
     "SELECT id, policy_json FROM relay_policies WHERE enabled = 1 ORDER BY id";
 
 // ---- relay bearers ----
+// Column order (incl. the F15 remote-binding cols 10/11) MUST match `serial::{bind,deserialize}_bearer_row`.
 pub const SAVE_BEARER: &str = "\
-INSERT OR REPLACE INTO relay_bearers(token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac) \
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-/// Column order MUST match `serial::deserialize_bearer_row` (0..=9).
+INSERT OR REPLACE INTO relay_bearers(token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac, client_id, dpop_jkt) \
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+/// Column order MUST match `serial::deserialize_bearer_row` (0..=11).
 pub const SELECT_BEARER_COLS: &str =
-    "token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac";
+    "token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac, client_id, dpop_jkt";
 pub const LOAD_BEARER: &str = "\
-SELECT token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac \
+SELECT token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac, client_id, dpop_jkt \
 FROM relay_bearers WHERE token_id = ?";
 pub const LIST_BEARERS_FOR_RELAY: &str = "\
-SELECT token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac \
+SELECT token_id, policy_id, mac, expires_at_ms, issued_at_ms, issued_boottime_ms, client_uid, client_pid, revoked, row_mac, client_id, dpop_jkt \
 FROM relay_bearers WHERE policy_id = (SELECT id FROM relay_policies WHERE relay_id = ?)";
 pub const REVOKE_BEARERS_FOR_RELAY: &str = "\
 UPDATE relay_bearers SET revoked = 1 \
 WHERE revoked = 0 AND policy_id = (SELECT id FROM relay_policies WHERE relay_id = ?)";
+
+// ---- remote clients (Phase 8, F15) ----
+pub const SAVE_REMOTE_CLIENT: &str = "\
+INSERT OR REPLACE INTO remote_clients(client_id, dpop_jkt, enabled, hardware_bound, created_at_ms, revoked_at_ms) \
+VALUES(?, ?, ?, ?, ?, ?)";
+/// Column order MUST match `serial::deserialize_remote_client` (0..=5).
+pub const LOAD_REMOTE_CLIENT: &str = "\
+SELECT client_id, dpop_jkt, enabled, hardware_bound, created_at_ms, revoked_at_ms \
+FROM remote_clients WHERE client_id = ?";
+pub const LIST_REMOTE_CLIENTS: &str = "\
+SELECT client_id, dpop_jkt, enabled, hardware_bound, created_at_ms, revoked_at_ms \
+FROM remote_clients ORDER BY client_id";
+pub const REVOKE_REMOTE_CLIENT: &str =
+    "UPDATE remote_clients SET enabled = 0, revoked_at_ms = ? WHERE client_id = ?";
 
 // ---- certs ----
 pub const SAVE_CERT: &str =
