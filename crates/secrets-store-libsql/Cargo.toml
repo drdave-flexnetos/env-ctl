@@ -1,19 +1,17 @@
 # envctl-secrets-store-libsql
 #
-# CONDITIONAL CRATE — NOT a member of the root [workspace]. See README.md (audit F1).
+# WORKSPACE MEMBER (OI-1 RESOLVED (a)). The libSQL `Store` backend, C-quarantined to this crate.
 #
-# The C-purity gate the DESIGN specified greps for `libsql-ffi|libsql-sys|sqlite3-sys` and PASSES
-# for `libsql` with `default-features=false, features=["remote"]` (the C-SQLite `core` path is NOT
-# pulled). BUT the `remote` feature transitively pulls `libsql-sqlite3-parser`, whose build.rs
-# compiles `third_party/lemon/lemon.c` with `cc` to codegen the SQL grammar — so a C TOOLCHAIN is
-# still required at BUILD time. That fails the SPIRIT of audit F1 ("no C in the remote client"),
-# so this crate is deliberately kept OUT of [workspace.members]; the workspace stays on inmem-store.
-#
-# An empty `[workspace]` table makes this crate its OWN workspace root so it can be built/inspected
-# standalone (`cargo build` / `cargo tree` from this dir) WITHOUT being absorbed by the root
-# env-ctl workspace. Remove this table and add the path to ../../Cargo.toml [workspace.members]
-# ONLY if/when a C-toolchain-free remote path lands (reopen OI-1).
-[workspace]
+# C-purity boundary (the upheld tenet = "no C *library* in the trust boundary"):
+#   - `default-features=false, features=["remote"]` does NOT pull the bundled C-SQLite `core`
+#     (`libsql-ffi`/`libsql-sys`/`sqlite3-sys`) — nothing C is LINKED. Proven by ci/gates/no-c.sh §3a.
+#   - `remote` DOES pull `libsql-sqlite3-parser`, whose build.rs runs `cc` on `third_party/lemon/
+#     lemon.c` to CODEGEN the SQL grammar as Rust. That is a build-time toolchain need, not a linked
+#     C library — and `cc` is already mandatory for the engine itself (ring + blake3). So this adds
+#     no new *class* of dependency to the build, and no C to any address space that handles secrets.
+#   - This crate is consumed ONLY by secretd, behind the engine `Store` trait; engine/proto/cli
+#     never link it. Engine default store stays `inmem-store`; secretd runtime selection is Phase 1.
+#   - Target remains strict C-toolchain-free (blake3 `pure` + a pure-Rust Hrana client) — see OI-1.
 
 [package]
 name = "envctl-secrets-store-libsql"
@@ -21,24 +19,21 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-description = "libSQL Store backend (C-quarantined, remote-client only) — CONDITIONAL on audit F1"
+description = "libSQL remote Store backend (C-quarantined, links no C library) — adopted, OI-1 RESOLVED (a)"
 
 [dependencies]
 # Consumes ONLY the engine's public Store trait + row types. The engine itself never links libSQL.
-envctl-secrets-engine = { path = "../secrets-engine" }
-anyhow = "1.0"
-serde_json = "1.0"
-# `net` is required for the current-thread reactor's I/O driver (hyper/HTTP transport to sqld);
-# `rt` keeps it single-threaded (no `rt-multi-thread` worker pool). All pure-Rust on Linux.
-tokio = { version = "1.43", features = ["rt", "sync", "time", "net"] }
-tracing = "0.1"
-
-# CANDIDATE A (chosen for the compiling impl): remote-only libSQL client.
-#   - Literal audit-F1 gate (libsql-ffi|libsql-sys|sqlite3-sys) PASSES (core/C-SQLite not pulled).
-#   - BUT pulls libsql-sqlite3-parser -> cc -> compiles lemon.c at build time (NOT C-toolchain-free).
-# CANDIDATE B (libsql-client 0.1 + libsql-hrana 0.1): C-free by design BUT fails to compile in 2026
-#   (worker-macros 0.0.6 / syn 1.0.109 bitrot). Dead end — see README.md.
-libsql = { version = "0.9.30", default-features = false, features = ["remote"] }
+envctl-secrets-engine = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+# Store bridges the sync `Store` trait to async libSQL via a PRIVATE current-thread runtime
+# (`Builder::new_current_thread`, see sync.rs). Features unify to the workspace tokio superset at the
+# member level; the store never spawns a `rt-multi-thread` worker pool of its own. All pure-Rust.
+tokio = { workspace = true }
+tracing = { workspace = true }
+# remote-only libSQL client (pinned in root [workspace.dependencies], OI-1 RESOLVED (a)):
+# `default-features=false, features=["remote"]` — no linked C-SQLite; see this crate's header + README.
+libsql = { workspace = true }
 
 [features]
 # `remote` is the ONLY supported wiring (pure HTTP/Hrana, no C-SQLite `core`). `embedded` is a

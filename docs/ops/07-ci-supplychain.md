@@ -36,57 +36,79 @@ The unifying principle from envctl is inherited verbatim: **fail-closed**. A CI 
 
 Per OI-1 (RESOLVED = libSQL) and SERVER-MODE §2.2/§78–81, the blanket `! cargo tree | grep libsql-ffi` is **replaced** by a per-crate scoped pair. The engine library stays pure-Rust; libSQL's bundled C SQLite is an accepted, scoped waiver quarantined to the (Phase-1) `crates/secrets-store-libsql`. CI enforces exactly this boundary.
 
-> Note on crate state: as of this box's checkout, `crates/` contains only `secrets-engine`, `secrets-proto`, `secretd`, `secretctl`. `secrets-store-libsql` does NOT exist yet (it lands in Phase 1, ROADMAP). The store-crate gates below are written to be **conditional**: they run only if the crate is present, so Phase-0 CI is green today and the gate auto-arms when the crate appears.
+> Note on crate state: `crates/secrets-store-libsql` is now a `[workspace.members]` entry (OI-1 RESOLVED (a)), so Gate 3a below is **ARMED** — it builds the crate's `remote` wiring and asserts no `libsql-ffi` is linked (verified passing: 106 workspace tests green, no `aws-lc-*`/`openssl-sys`, one ring-only `rustls`). The gates remain written to be **conditional** (Gate 3 runs only if the crate is present), so they stay correct regardless. The materialized, runnable scripts live at `ci/gates/no-c.sh` and `ci/gates/shape.sh` (keep them in sync with the blocks below).
 
 ```bash
 #!/usr/bin/env bash
 # ci/gates/no-c.sh — fail-closed no-C / single-backend gate.
+#
+# HARDENING (audit wqj72spx0): every `cargo tree` is captured to a variable FIRST so a tree error
+# fails CLOSED (an inline `if cargo tree | grep` reads a failed/empty tree as "no C dep" and silently
+# passes). Gate 4 reads the AUTHORITATIVE resolved graph from `cargo metadata` via python3, NOT
+# `cargo tree -i`: the inverse tree errors "specification is ambiguous" (exit 101, empty stdout) the
+# moment a crate has two versions — which, swallowed by `2>/dev/null || true`, was a FALSE PASS
+# exactly when a second rustls/aws-lc would appear. `cargo metadata` is also immune to false-matching
+# an optional/unresolved dependency *declaration* (e.g. rustls declares aws-lc-rs optional).
 set -euo pipefail
 
 fail() { echo "NO-C GATE FAIL: $*" >&2; exit 1; }
 
 # --- Gate 1: the engine LIB is pure-Rust (always armed). DESIGN-NOTES R9, SERVER-MODE §79 ---
-# --all-features so an optional/transitive C dep cannot hide behind a feature flag.
+# --all-features so an optional/transitive C dep cannot hide behind a feature flag. Capture-first.
 ENGINE_TREE=$(cargo tree -p envctl-secrets-engine --all-features --edges normal,build)
-if grep -Eq 'libsql-ffi|sqlite3-sys|rusqlite|openssl-sys|aws-lc-sys|aws-lc-rs|ring-asm-bundled-c' <<<"$ENGINE_TREE"; then
+if grep -Eq 'libsql-ffi|sqlite3-sys|rusqlite|openssl-sys|aws-lc-sys|aws-lc-rs' <<<"$ENGINE_TREE"; then
   fail "C dependency linked into envctl-secrets-engine"
 fi
 
 # --- Gate 2: proto + cli stay C-free (SERVER-MODE §81) ---
 for crate in envctl-secrets-proto envctl-secretctl; do
-  if cargo tree -p "$crate" --all-features --edges normal,build \
-       | grep -Eq 'libsql-ffi|sqlite3-sys|openssl-sys|aws-lc-sys|aws-lc-rs'; then
+  CRATE_TREE=$(cargo tree -p "$crate" --all-features --edges normal,build)
+  if grep -Eq 'libsql-ffi|sqlite3-sys|openssl-sys|aws-lc-sys|aws-lc-rs' <<<"$CRATE_TREE"; then
     fail "C dependency linked into $crate"
   fi
 done
 
-# --- Gate 3: store-crate scoped waiver (auto-arms when the Phase-1 crate exists). SERVER-MODE §80 ---
-if cargo metadata --no-deps --format-version 1 \
-     | grep -q '"name":"envctl-secrets-store-libsql"'; then
-  # 3a: the RECOMMENDED wiring (pure-Rust `remote` client) MUST be C-free.
-  if cargo tree -p envctl-secrets-store-libsql --no-default-features --features remote \
-       | grep -q 'libsql-ffi'; then
-    fail "remote-client build of store crate links libsql-ffi (should be pure-Rust)"
+# --- Gate 3: store-crate scoped waiver (auto-arms when the crate exists). SERVER-MODE §80 ---
+if cargo metadata --no-deps --format-version 1 | grep -q '"name":"envctl-secrets-store-libsql"'; then
+  # 3a: the SHIPPING wiring (pure-Rust `remote` client) MUST link no C SQLite. Capture-first.
+  STORE_TREE=$(cargo tree -p envctl-secrets-store-libsql --no-default-features --features remote)
+  if grep -Eq 'libsql-ffi|libsql-sys|sqlite3-sys' <<<"$STORE_TREE"; then
+    fail "remote-client build of store crate links a C SQLite (libsql-ffi/libsql-sys/sqlite3-sys)"
   fi
-  # 3b: the embedded build is the DOCUMENTED, BOUNDED waiver: it MAY pull libsql-ffi,
-  #     but ONLY this crate may. Assert no OTHER crate transitively pulls it.
-  #     (libsql-ffi must appear ONLY under the store crate's subtree.)
-  echo "store-crate embedded build is a recorded scoped waiver (research/03 §3 risk acceptance)"
+  # 3b: no-op note (honest). The `embedded` feature (a future risk-accepted in-process C-SQLite
+  #     fallback) is an UNIMPLEMENTED placeholder that pulls no libsql feature, so there is nothing to
+  #     scope yet. If implemented, add an assertion that libsql-ffi is reachable ONLY via this crate.
+  echo "note: store-crate 'embedded' (in-process C-SQLite) is an unbuilt placeholder; remote-only ships"
 fi
 
-# --- Gate 4: single rustls on the ring path, zero aws-lc / openssl anywhere. DESIGN-NOTES R7, CF-2 ---
-RUSTLS_COUNT=$(cargo tree -i rustls --depth 0 2>/dev/null | grep -c '^rustls ' || true)
-[ "$RUSTLS_COUNT" -le 1 ] || fail "more than one rustls version in the graph ($RUSTLS_COUNT)"
-if cargo tree -i aws-lc-sys  2>/dev/null | grep -q .; then fail "aws-lc-sys in the graph (must be ring-only)"; fi
-if cargo tree -i aws-lc-rs   2>/dev/null | grep -q .; then fail "aws-lc-rs in the graph (must be ring-only)";  fi
-if cargo tree -i openssl-sys 2>/dev/null | grep -q .; then fail "openssl-sys in the graph";                    fi
-# Confirm rustls actually rides `ring` (positive assertion, not just the absence of aws-lc).
-cargo tree -i ring 2>/dev/null | grep -q . || fail "ring backend not present — rustls backend pin broke"
+# --- Gate 4: exactly one ring-only rustls; zero aws-lc/openssl/C-SQLite ANYWHERE. DESIGN-NOTES R7, CF-2 ---
+# Authoritative resolved graph (`cargo metadata` .resolve.nodes), parsed with python3.
+cargo metadata --format-version 1 | python3 -c '
+import json,sys
+m=json.load(sys.stdin)
+idmap={p["id"]:(p["name"],p["version"]) for p in m["packages"]}
+resolved={}
+for node in m["resolve"]["nodes"]:
+    name,ver=idmap[node["id"]]
+    resolved.setdefault(name,set()).add(ver)
+def die(msg):
+    sys.stderr.write("NO-C GATE FAIL: "+msg+"\n"); sys.exit(1)
+banned=["aws-lc-sys","aws-lc-rs","openssl-sys","libsql-ffi","libsql-sys","sqlite3-sys","rusqlite"]
+present=[c for c in banned if resolved.get(c)]
+if present:
+    die("forbidden C crate(s) resolved into the graph: "+", ".join(c+" "+str(sorted(resolved[c])) for c in present))
+rv=sorted(resolved.get("rustls",[]))
+if len(rv)>1:
+    die("more than one rustls version in the graph: "+str(rv))
+if not resolved.get("ring"):
+    die("ring backend not present — rustls crypto-provider pin broke")
+print("resolved graph clean: rustls="+(str(rv) if rv else "none")+" on ring="+str(sorted(resolved["ring"]))+"; zero aws-lc/openssl/C-SQLite")
+'
 
 echo "NO-C GATE PASS"
 ```
 
-**Why each `cargo tree` flag matters:** `--all-features` defeats a C dep hiding behind an unused feature; `--edges normal,build` catches a C dep pulled by a `build.rs` (exactly how `libsql-ffi` compiles the 8.9 MB `sqlite3.c`, CF-1); `cargo tree -i <pkg>` (inverse) lists *who* depends on the crate, so a non-empty result for `aws-lc-sys` names the offending edge.
+**Why each `cargo tree` flag matters:** `--all-features` defeats a C dep hiding behind an unused feature; `--edges normal,build` catches a C dep pulled by a `build.rs` (exactly how `libsql-ffi` compiles the 8.9 MB `sqlite3.c`, CF-1). **Gate 4 deliberately does NOT use `cargo tree -i <pkg>`** for the presence/count checks: the inverse tree errors `specification is ambiguous` (exit 101, empty stdout) the instant a package resolves to two versions (the workspace already has two `hyper` majors via libSQL), and with `2>/dev/null || true` that became a FALSE PASS exactly when a second `rustls`/`aws-lc` would appear (audit wqj72spx0). Instead it reads the resolved graph from `cargo metadata` (`.resolve.nodes`, never ambiguous) and ignores optional/unresolved dependency *declarations* (`rustls` declares `aws-lc-rs` optional, so a naive metadata grep would false-FAIL).
 
 Security rationale (sourced): `libsql-ffi-0.9.30/bundled/src/sqlite3.c` is compiled by its `build.rs` and there is no pure-Rust path (DESIGN-NOTES CF-1, VERIFIED). The recommended deployment isolates that C core into a separate `sqld` process and uses libSQL's pure-Rust `remote` client (`default-features=false, features=["remote"]`, VERIFIED pure-Rust per SERVER-MODE §2.2) — so Gate 3a is the *production-path* assertion and Gate 3b is the bounded waiver for the risk-accepted in-process fallback.
 

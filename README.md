@@ -42,14 +42,19 @@ The **entire security-critical engine is built, independently audited, and green
 | **Local daemon** — `secretd` tonic gRPC over a Unix socket, `SO_PEERCRED` owner-only, engine-bridged Lock/Vault/Relay/Audit services + event streaming | ✅ e2e |
 | **CLI** — `secretctl` (the `env-ctl` verbs) over the UDS, pretty + `--json` | ✅ |
 
-**97 tests pass** (`cargo test --workspace`); the engine is **pure-Rust, C-free, async-free**;
-everything compiles on stable. Two independent multi-agent security audits (Phase-1 crypto+vault,
-and the SERVER-MODE remote-edge design) are committed under [`docs/audits/`](docs/audits).
+**106 tests pass** (`cargo test --workspace`; includes the libSQL store crate's 9 offline tests —
+its 5 sqld integration tests are `#[ignore]`d); the engine is **pure-Rust, C-free, async-free** (no C
+*library* in the trust boundary — `ci/gates/no-c.sh` proves it); everything compiles on stable. Two
+independent multi-agent security audits (Phase-1 crypto+vault, and the SERVER-MODE remote-edge design)
+are committed under [`docs/audits/`](docs/audits).
 
 ## Remaining
 
-- **Durable store** — `secrets-store-libsql` (libSQL behind the `Store` trait; today the vault uses
-  a real in-memory store). Gated on a required `cargo tree` C-free check (audit F1).
+- **Durable store — runtime wiring (Phase 1).** `secrets-store-libsql` (the libSQL `remote` `Store`
+  impl) is **adopted into the workspace** (OI-1 RESOLVED (a)): it builds, is gated C-free by
+  `ci/gates/no-c.sh`, and adds 9 offline tests. What remains is **runtime selection in `secretd`**
+  (config = sqld URL + auth token; transport loopback/TLS) — `Engine::with_seams(Box<dyn Store>)`
+  already provides the seam. Until then the engine default store stays the in-memory backend.
 - **Remote edge (Phase 8, deferred by design)** — the HTTPS + DPoP-sender-bound relay plane for
   remote/cloud agents (e.g. a Telegram bot). The SERVER-MODE audit confirms this needs the remote
   bearer-binding, jti replay-store, streaming-revocation, and public-edge TLS work landed
@@ -67,7 +72,7 @@ crates/
   secrets-proto/    envctl-secrets-proto  — gRPC control-plane proto (env_ctl.v1), compiled with protox
   secretd/          envctl-secretd        — the daemon (gRPC/UDS control plane; relay proxy = Phase 8)
   secretctl/        envctl-secretctl      — the env-ctl CLI
-  secrets-store-libsql/  (in progress)    — quarantined libSQL Store impl (C isolated here only)
+  secrets-store-libsql/  envctl-secrets-store-libsql — libSQL `remote` Store (C-quarantined; adopted OI-1(a); secretd wiring = Phase 1)
 docs/   ARCHITECTURE · DESIGN-NOTES · ROADMAP · THREAT-MODEL · SERVER-MODE · research/ (15) · ops/ (7) · audits/ (2)
 ```
 
@@ -75,7 +80,8 @@ docs/   ARCHITECTURE · DESIGN-NOTES · ROADMAP · THREAT-MODEL · SERVER-MODE �
 
 ```bash
 cargo build --workspace
-cargo test  --workspace          # 97 passing
+cargo test  --workspace          # 106 passing (5 sqld integration tests #[ignore]d)
+bash ci/gates/no-c.sh            # no C *library* in the trust boundary; one ring-only rustls
 cargo test -p envctl-secrets-engine   # crypto/vault/broker unit + integration tests
 # CI gates: engine is C-free + async-free, exactly one rustls on the ring path (no aws-lc).
 ```
@@ -84,7 +90,8 @@ cargo test -p envctl-secrets-engine   # crypto/vault/broker unit + integration t
 
 **Core complete + locally runnable.** The audited engine and the local daemon run end-to-end on the
 box (`secretctl ↔ secretd ↔ engine` over the UDS, with a real encrypted vault + relay broker).
-Durable libSQL storage and the remote relay edge are the remaining phases — see
+The libSQL `remote` store crate is adopted (OI-1 RESOLVED (a), C-quarantined); wiring it into
+`secretd` and the remote relay edge are the remaining phases — see
 [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/SERVER-MODE.md`](docs/SERVER-MODE.md). Decisions and
 their rationale live in [`docs/DESIGN-NOTES.md`](docs/DESIGN-NOTES.md); the merge plan in
 [`docs/CHARTER.md`](docs/CHARTER.md).

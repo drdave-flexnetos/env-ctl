@@ -6,15 +6,16 @@
 //! a PRIVATE current-thread tokio runtime ([`sync::SyncConnection`]), so the engine stays
 //! async-free.
 //!
-//! ## C-purity status (audit F1) — see README.md
+//! ## C-purity status (OI-1 RESOLVED (a)) — see README.md
 //!
-//! The DESIGN's literal gate (`libsql-ffi|libsql-sys|sqlite3-sys`) PASSES for
+//! The literal gate (`libsql-ffi|libsql-sys|sqlite3-sys`) PASSES for
 //! `libsql { default-features = false, features = ["remote"] }` — the C-SQLite `core` path is NOT
-//! pulled. HOWEVER the `remote` feature transitively requires `libsql-sqlite3-parser`, whose
-//! `build.rs` compiles `lemon.c` via `cc` at build time. That requires a C toolchain and so fails
-//! the SPIRIT of audit F1. This crate is therefore deliberately NOT a `[workspace.members]` entry;
-//! the workspace stays on `inmem-store`. The code below compiles and is correct; it is held back
-//! ONLY on the C-toolchain-purity decision.
+//! pulled, so NO C *library* is linked. The `remote` feature does pull `libsql-sqlite3-parser`,
+//! whose `build.rs` runs `cc` on `lemon.c` to CODEGEN the SQL grammar as Rust (build-time only;
+//! nothing C is linked). That build-time `cc` is ACCEPTED under decision (a): it is already
+//! mandatory for the engine via ring + blake3. The upheld tenet is "no C *library* in the trust
+//! boundary," and this crate is now a `[workspace.members]` entry, gated by `ci/gates/no-c.sh`
+//! (Gate 3a). Engine default store stays `inmem-store`; secretd runtime selection is Phase 1.
 
 #![deny(unsafe_code)]
 

@@ -12,8 +12,10 @@ daemon; per-client **relay bearers** (≤24h, scoped, peer-bound, revocable, USB
 the real key at egress. Pull the USB = physical kill switch.
 
 ## State (as of this handoff)
-**Core complete, twice-audited, locally runnable. 97 tests green; stable Rust; no C *library* in the
-trust boundary.** All pushed.
+**Core complete, twice-audited, locally runnable. 106 tests green; stable Rust; no C *library* in the
+trust boundary.** All pushed. **OI-1 RESOLVED (a):** the libSQL `remote` store crate is now a
+workspace member (build-time `cc` accepted — it is already required by ring+blake3; no C *library* is
+linked), with the no-C / single-ring-backend gate materialized + armed at `ci/gates/no-c.sh`.
 - **Engine** (`crates/secrets-engine`, lib `envctl_secrets`, pure-Rust): XChaCha20-Poly1305 at-rest,
   argon2id+HKDF dual-KEK keyslots, BLAKE3-keyed MACs, dual-factor vault (init/unlock/lock/secret
   put+get), tamper-evident audit chain + DEK-keyed monotonic high-water anchor, broker (`decide()`
@@ -25,14 +27,21 @@ trust boundary.** All pushed.
 - **Build workflows:** `workflows/` (the 12 multi-agent scripts that built it; see its README).
 
 ## Remaining
-1. **OI-1 (store backend) — REOPENED, needs your call.** `crates/secrets-store-libsql` has a complete
-   `Store` impl (compiles, 9 tests) but is **held out of `[workspace.members]`**: the libSQL `remote`
-   client pulls `libsql-sqlite3-parser`, whose `build.rs` compiles `lemon.c` via `cc` → a **C
-   build-toolchain is required**. The literal no-C grep passes; the spirit fails. Crucial nuance:
-   **the engine already needs `cc` (blake3 SIMD asm)**, so the real, upheld tenet is *"no C **library**
-   in the trust boundary"* (no SQLite/OpenSSL/aws-lc), not "no `cc`." Decide: **(a)** accept a C
-   build-toolchain and adopt the crate, or **(b)** strict C-toolchain-free (blake3 `pure` + a pure-Rust
-   Hrana client). See the operator notes below and `crates/secrets-store-libsql/README.md`.
+1. **OI-1 (store backend) — RESOLVED (a). ✅** `crates/secrets-store-libsql` (libSQL `remote` `Store`
+   impl) is now a `[workspace.members]` entry; `libsql` is pinned in `[workspace.dependencies]`
+   (`default-features=false, features=["remote"]`). Operator chose **(a): accept a build-time C
+   toolchain** — verified empirically that the engine ALREADY needs `cc` via **ring** (compiles
+   C/asm) **and blake3** (SIMD), so the upheld tenet is *"no C **library** linked in the trust
+   boundary"* — proven by `ci/gates/no-c.sh` (no `libsql-ffi`/`libsql-sys`/`sqlite3-sys`, no
+   `aws-lc-*`/`openssl-sys`, exactly one ring-only `rustls`). Workspace builds + **106 tests green**;
+   5 sqld integration tests `#[ignore]`d. `lemon.c` is build-time codegen (emits Rust; nothing C
+   linked). **Follow-on (Phase 1):** wire secretd to runtime-select this backend (config = sqld URL +
+   auth token; transport = loopback or TLS) — `Engine::with_seams` already takes `Box<dyn Store>`, so
+   the seam exists. **Residual:** libSQL `remote` pulls a duplicate-major legacy stack (`hyper 0.14`,
+   `http 0.2`, `h2 0.3`, `base64 0.21`, and a 2nd `prost` major `0.12` via `libsql-hrana`) — all
+   pure-Rust, confined to the libsql subtree, linked into nothing shipping. **Target** stays strict
+   C-toolchain-free (blake3 `pure` + a pure-Rust Hrana client). See
+   `crates/secrets-store-libsql/README.md`.
 2. **Remote edge (Phase 8, deferred by design):** the HTTPS + DPoP-sender-bound relay plane for remote
    clients (e.g. a Telegram bot). The SERVER-MODE audit lists exactly what to bridge in (remote
    bearer binding into `decide()`/schema, jti replay store, streaming revocation, public-edge TLS).

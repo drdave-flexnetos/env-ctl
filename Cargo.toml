@@ -5,6 +5,7 @@ members = [
   "crates/secrets-proto",
   "crates/secretd",
   "crates/secretctl",
+  "crates/secrets-store-libsql",   # OI-1 RESOLVED (a): adopted — see [workspace.dependencies] libsql note
 ]
 
 [workspace.package]
@@ -42,13 +43,17 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 webpki-roots = "0.26"   # explicit frozen Mozilla roots for upstream egress (never OS store / local CA)
 
-# ---- store: backend behind a Store trait. OI-1 RESOLVED = libSQL (NEW-3): its server/replica/sync is
-# ---- the required remote-serving feature. libSQL + its bundled C SQLite are QUARANTINED in the new
-# ---- `crates/secrets-store-libsql` crate (consumed ONLY by secretd, behind the engine `Store` trait);
-# ---- the engine workspace member stays pure-Rust. Phase 0 still ships only inmem-store; the libSQL
-# ---- backend lands in Phase 1 in the store/daemon layer, C-isolated.
-# ---- CI gate is now per-crate: `! cargo tree -p envctl-secrets-engine | grep libsql-ffi` MUST pass
-# ---- (engine green); the libsql row lives in secrets-store-libsql only (documented, scoped waiver).
+# ---- store: backend behind a Store trait. OI-1 RESOLVED (a) = libSQL `remote` (NEW-3): its
+# ---- server/replica/sync is the required remote-serving feature. The libsql dep lives ONLY in
+# ---- `crates/secrets-store-libsql` (consumed ONLY by secretd, behind the engine `Store` trait); the
+# ---- engine/proto/cli members never link it. `default-features=false, features=["remote"]` so the
+# ---- bundled C-SQLite `core` path (`libsql-ffi`) is NOT pulled — proven by ci/gates/no-c.sh Gate 3a.
+# ---- Upheld tenet = "no C *library* in the trust boundary" (no SQLite/OpenSSL/aws-lc). NOT upheld:
+# ---- "no `cc`" — a C build-toolchain is already mandatory via ring + blake3 (engine), and `remote`
+# ---- adds `libsql-sqlite3-parser`'s build-time `lemon.c` codegen (emits Rust; nothing C is linked).
+# ---- Engine default store stays `inmem-store`; secretd runtime selection of this backend is Phase 1.
+# ---- Target remains strict C-toolchain-free (blake3 `pure` + a pure-Rust Hrana client) — see OI-1.
+libsql = { version = "0.9.30", default-features = false, features = ["remote"] }
 
 # ---- crypto (engine; pure-Rust, no C/SQLCipher) ----
 chacha20poly1305 = { version = "0.10", features = ["alloc", "getrandom", "rand_core"] }
