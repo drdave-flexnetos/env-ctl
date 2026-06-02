@@ -107,6 +107,13 @@ trust boundary"** (no SQLite/OpenSSL/aws-lc). Under that tenet libSQL `remote` i
   a libSQL bump.
 - The production sqld transport must be loopback or TLS (the integration tests use plaintext
   `http://127.0.0.1` for TEST ONLY). secretd runtime wiring + transport hardening is Phase 1.
+- **Known advisory (accepted): CVE-2025-47736 / GHSA-8m95-fffc-h4c5** — `libsql-sqlite3-parser`
+  `<= 0.13.0` (the lemon-rs SQL parser) can crash (panic/DoS) on **invalid-UTF-8 SQL text**. **No
+  patched release exists** (0.13.0 is the latest on crates.io; the fix is unreleased upstream in
+  `gwenn/lemon-rs`). **Not reachable here:** this crate executes ONLY static, constant SQL (see
+  `schema.rs`); every user/row value is a bound `?` parameter, never concatenated into query text — so
+  no attacker-controlled bytes reach the parser as SQL grammar. Impact is a crash, not memory
+  unsafety; the crate is also a not-yet-wired orphan. Re-evaluate when a patched `libsql`/parser ships.
 
 ### Target (the standing goal)
 
