@@ -757,6 +757,324 @@ fn header_mac_mismatch_leaves_vault_locked() {
     ));
 }
 
+// ---- 12. truncate + stale-anchor replay (H-1 monotonic-anchor regression) --------------------
+
+/// Helper: spin up an unlocked vault over a fresh shared `InMemStore`, put `n` secrets (growing the
+/// chain), and return `(eng, inmem, sink, rx)`. The caller drives further attacks/asserts.
+fn unlocked_vault_with_puts(
+    pass: &str,
+    n: usize,
+) -> (
+    Engine,
+    std::sync::Arc<InMemStore>,
+    envctl_secrets::EventSink,
+    std::sync::mpsc::Receiver<SecretEvent>,
+) {
+    let inmem = std::sync::Arc::new(InMemStore::new());
+    let eng = engine_with(Box::new(SharedStore(inmem.clone())), Box::new(AbsentUsb));
+    let (sink, rx) = envctl_secrets::EventSink::channel();
+    eng.init_vault(pp(pass), None, None, at_floor_params(), &sink)
+        .unwrap();
+    eng.unlock(Unlock::Passphrase(pp(pass)), &sink).unwrap();
+    for i in 0..n {
+        eng.secret_put(
+            SecretMeta {
+                name: "a".to_string(),
+                provider: envctl_secrets::Provider::Generic,
+                note: format!("v{i}"),
+                broker_only: false,
+            },
+            Zeroizing::new(b"v".to_vec()),
+            &sink,
+        )
+        .unwrap();
+    }
+    let _ = drain(&rx);
+    (eng, inmem, sink, rx)
+}
+
+#[test]
+fn truncate_and_replay_stale_anchor() {
+    // ATTACK A — truncate ONLY (anchor + high-water still at the grown tail). Caught by the FLOOR.
+    {
+        // Grow to k rows, snapshot the stale seq-k anchor + high-water, then grow k+3 more.
+        let (eng, inmem, sink, _rx) = unlocked_vault_with_puts("trunc-a", 3);
+        let rows_at_k = inmem.audit_rows().len();
+        let _stale_head = inmem.get_meta("vault.audit_head").unwrap().unwrap();
+        let _stale_hw = inmem.get_meta("vault.audit_high_water").unwrap().unwrap();
+        for _ in 0..3 {
+            eng.secret_put(
+                SecretMeta {
+                    name: "a".to_string(),
+                    provider: envctl_secrets::Provider::Generic,
+                    note: "more".to_string(),
+                    broker_only: false,
+                },
+                Zeroizing::new(b"v".to_vec()),
+                &sink,
+            )
+            .unwrap();
+        }
+        // Truncate back to exactly k rows, leaving the anchor + high-water at k+3.
+        let now = inmem.audit_rows().len();
+        inmem.truncate_audit_tail(now - rows_at_k);
+        assert_eq!(inmem.audit_rows().len(), rows_at_k);
+        // The unkeyed chain STILL verifies (it is just a clean, shorter chain) — the gap the anchor
+        // must close.
+        inmem
+            .verify_audit_chain()
+            .expect("a truncated chain still passes the UNKEYED verifier");
+        // THE CORE NEW DETECTION: cur_max_seq (k) < stored_high_water (k+3) => rejected at the floor.
+        // The seq carried in AuditChainBroken is the SHORT live max-seq (= rows_at_k), confirming the
+        // rejection observed the truncated chain (the floor's signature), not a stale snapshot.
+        let cur_seq = inmem.audit_rows().last().map_or(0, |r| r.seq);
+        assert_eq!(cur_seq as usize, rows_at_k, "post-truncation live max-seq == k");
+        let err = eng
+            .verify_audit_anchor(&sink)
+            .expect_err("the high-water floor must reject the truncated-but-stale-anchored chain");
+        assert!(
+            matches!(
+                err.downcast_ref::<EngineError>(),
+                Some(EngineError::AuditChainBroken(s)) if *s == cur_seq
+            ),
+            "expected AuditChainBroken(cur_seq={cur_seq}) from the floor, got {err:?}"
+        );
+    }
+
+    // ATTACK B — truncate AND replay the captured stale anchor BUT NOT the high-water (an
+    // INCONSISTENT rollback). With THESE numbers the chain is truncated BELOW the un-rewound
+    // high-water, so the HIGH-WATER FLOOR (`cur_seq < stored_hw`) is the actual catcher and fires
+    // BEFORE step 4 ever runs. (Restoring the stale lower-seq MAC would ALSO mismatch at step 4 had
+    // the floor not already rejected — but that branch is exercised by
+    // `stale_anchor_replay_caught_at_mac_not_floor` below, where `cur_seq >= high_water`.)
+    {
+        let (eng, inmem, sink, _rx) = unlocked_vault_with_puts("trunc-b", 3);
+        let rows_at_k = inmem.audit_rows().len();
+        let stale_head = inmem.get_meta("vault.audit_head").unwrap().unwrap();
+        for _ in 0..3 {
+            eng.secret_put(
+                SecretMeta {
+                    name: "a".to_string(),
+                    provider: envctl_secrets::Provider::Generic,
+                    note: "more".to_string(),
+                    broker_only: false,
+                },
+                Zeroizing::new(b"v".to_vec()),
+                &sink,
+            )
+            .unwrap();
+        }
+        let now = inmem.audit_rows().len();
+        inmem.truncate_audit_tail(now - rows_at_k);
+        // Restore the seq-k MAC, but leave the high-water at k+3 (an INCONSISTENT rollback).
+        inmem.tamper_meta("vault.audit_head", &stale_head);
+        let err = eng
+            .verify_audit_anchor(&sink)
+            .expect_err("an inconsistent stale-anchor replay must be rejected");
+        assert!(
+            matches!(
+                err.downcast_ref::<EngineError>(),
+                Some(EngineError::AuditChainBroken(_))
+            ),
+            "expected AuditChainBroken, got {err:?}"
+        );
+    }
+
+    // ATTACK C — truncate AND replay BOTH the stale anchor and the stale high-water together. This
+    // is the DOCUMENTED RESIDUAL: a full, consistent snapshot rollback is byte-for-byte a legitimate
+    // past vault state, so NO purely in-store mechanism can distinguish it. We pin it here so the
+    // limitation can never silently regress into a false guarantee. See THREAT-MODEL A2 /
+    // research/13 off-box anchoring.
+    {
+        let (eng, inmem, sink, _rx) = unlocked_vault_with_puts("trunc-c", 3);
+        let rows_at_k = inmem.audit_rows().len();
+        let stale_head = inmem.get_meta("vault.audit_head").unwrap().unwrap();
+        let stale_hw = inmem.get_meta("vault.audit_high_water").unwrap().unwrap();
+        for _ in 0..3 {
+            eng.secret_put(
+                SecretMeta {
+                    name: "a".to_string(),
+                    provider: envctl_secrets::Provider::Generic,
+                    note: "more".to_string(),
+                    broker_only: false,
+                },
+                Zeroizing::new(b"v".to_vec()),
+                &sink,
+            )
+            .unwrap();
+        }
+        let now = inmem.audit_rows().len();
+        inmem.truncate_audit_tail(now - rows_at_k);
+        inmem.tamper_meta("vault.audit_head", &stale_head);
+        inmem.tamper_meta("vault.audit_high_water", &stale_hw);
+        // ASSERTS THE RESIDUAL — a full consistent snapshot rollback is NOT detectable in-store.
+        eng.verify_audit_anchor(&sink).expect(
+            "a FULL consistent snapshot rollback (rows + anchor + high-water rewound together) is \
+             NOT detectable in-store; defeating it requires off-box anchoring (THREAT-MODEL A2)",
+        );
+    }
+}
+
+/// H-1 STEP-4 ISOLATION: prove the ANCHORED-ROW MAC compare (the load-bearing half of the fix) is
+/// actually wired and rejecting — the part NOT reached by the floor in ATTACK A/B (which all truncate
+/// BELOW the high-water). Here the chain is NOT truncated and the high-water is NOT rewound, so
+/// `cur_seq == high_water` and the HIGH-WATER FLOOR PASSES; only a stale lower-seq `audit_head` MAC is
+/// replayed over the current one. Detection therefore MUST come from step 4: the verifier reconstructs
+/// `audit_head_mac(dek, N, N, row@N)` and the constant-time compare against the replayed `MAC@k`
+/// (k < N) mismatches. A regression that broke the MAC binding (wrong row/seq, no-op compare) — the
+/// exact mutation `if false && ...ct_eq` — ships green against ATTACK A/B/C and `honest_*` but is
+/// caught HERE.
+#[test]
+fn stale_anchor_replay_caught_at_mac_not_floor() {
+    // Grow to k rows, snapshot the seq-k anchor MAC, then grow N (> k) rows.
+    let (eng, inmem, sink, _rx) = unlocked_vault_with_puts("mac-step4", 2);
+    let seq_at_k = inmem.audit_rows().last().map(|r| r.seq).unwrap();
+    let stale_head_at_k = inmem.get_meta("vault.audit_head").unwrap().unwrap();
+    for _ in 0..3 {
+        eng.secret_put(
+            SecretMeta {
+                name: "a".to_string(),
+                provider: envctl_secrets::Provider::Generic,
+                note: "grow".to_string(),
+                broker_only: false,
+            },
+            Zeroizing::new(b"v".to_vec()),
+            &sink,
+        )
+        .unwrap();
+    }
+    // Sanity: the chain genuinely grew, and the floor invariant we rely on holds.
+    let cur_seq = inmem.audit_rows().last().map(|r| r.seq).unwrap();
+    let stored_hw: i64 = inmem
+        .get_meta("vault.audit_high_water")
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(cur_seq > seq_at_k, "chain must have grown past k");
+    assert_eq!(stored_hw, cur_seq, "honest steady state: high_water == live max-seq");
+    let live_head = inmem.get_meta("vault.audit_head").unwrap().unwrap();
+    assert_ne!(stale_head_at_k, live_head, "the seq-k MAC must differ from the seq-N MAC");
+
+    // THE ATTACK: replay ONLY the stale seq-k MAC. Do NOT truncate the chain and do NOT rewind the
+    // high-water — so `cur_seq (N) == stored_hw (N)` and the floor (`cur_seq < stored_hw`) PASSES.
+    inmem.tamper_meta("vault.audit_head", &stale_head_at_k);
+
+    // Detection here is SOLELY step 4: reconstruct audit_head_mac(dek, N, N, row@N) and ct_eq it
+    // against the replayed MAC@k => mismatch. AuditChainBroken carries the live cur_seq.
+    let err = eng
+        .verify_audit_anchor(&sink)
+        .expect_err("a stale lower-seq anchor MAC must be rejected by the step-4 MAC compare");
+    assert!(
+        matches!(
+            err.downcast_ref::<EngineError>(),
+            Some(EngineError::AuditChainBroken(s)) if *s == cur_seq
+        ),
+        "expected AuditChainBroken(cur_seq={cur_seq}) from the step-4 MAC mismatch (floor passed), \
+         got {err:?}"
+    );
+}
+
+// ---- 13. honest append then verify passes; high-water is monotonic ----------------------------
+
+#[test]
+fn honest_append_then_verify_passes() {
+    let inmem = std::sync::Arc::new(InMemStore::new());
+    let eng = engine_with(Box::new(SharedStore(inmem.clone())), Box::new(AbsentUsb));
+    let (sink, rx) = envctl_secrets::EventSink::channel();
+    eng.init_vault(pp("honest-pass"), None, None, at_floor_params(), &sink)
+        .unwrap();
+    eng.unlock(Unlock::Passphrase(pp("honest-pass")), &sink).unwrap();
+
+    let read_hw = |s: &std::sync::Arc<InMemStore>| -> i64 {
+        s.get_meta("vault.audit_high_water")
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut last_hw = read_hw(&inmem);
+
+    // Interleave secret_put with a couple of lock()/unlock() cycles (driving the locked-time appends
+    // + the post-unlock advance). After each unlock the anchor must verify, and the high-water must
+    // never decrease across the whole run.
+    for round in 0u8..3 {
+        for i in 0..2 {
+            eng.secret_put(
+                SecretMeta {
+                    name: format!("k{round}"),
+                    provider: envctl_secrets::Provider::Generic,
+                    note: format!("r{round}-{i}"),
+                    broker_only: false,
+                },
+                Zeroizing::new(b"v".to_vec()),
+                &sink,
+            )
+            .unwrap();
+            let hw = read_hw(&inmem);
+            assert!(hw >= last_hw, "high-water must be monotonic (was {last_hw}, now {hw})");
+            last_hw = hw;
+        }
+        eng.lock(&sink).unwrap();
+        let hw_locked = read_hw(&inmem);
+        assert!(hw_locked >= last_hw, "lock must not lower the high-water");
+        last_hw = hw_locked;
+
+        eng.unlock(Unlock::Passphrase(pp("honest-pass")), &sink)
+            .expect("re-unlock must succeed");
+        // The just-recovered DEK verified the anchor at unlock (an Err would have refused it); the
+        // post-unlock advance re-anchored the locked-appended rows. Verify again explicitly.
+        eng.verify_audit_anchor(&sink)
+            .expect("the anchor must verify on an honest, growing chain");
+        let hw_unlocked = read_hw(&inmem);
+        assert!(hw_unlocked >= last_hw, "unlock must only raise the high-water");
+        last_hw = hw_unlocked;
+    }
+    let _ = drain(&rx);
+}
+
+// ---- 14. put_secret rejects a non-monotonic version (M-1, direct on InMemStore) --------------
+
+#[test]
+fn put_secret_rejects_non_monotonic_version() {
+    use envctl_secrets::vault::SecretRow;
+
+    fn row(store: &InMemStore, name: &str, version: u32) -> SecretRow {
+        SecretRow {
+            row_id: store.reserve_secret_row_id().unwrap(),
+            name: name.to_string(),
+            version,
+            provider: envctl_secrets::Provider::Generic,
+            note: String::new(),
+            broker_only: false,
+            dek_generation: 1,
+            nonce: vec![0u8; 24],
+            ct_tag: vec![0u8; 16],
+            created_ts: "2026-06-02T00:00:00Z".to_string(),
+        }
+    }
+
+    let s = InMemStore::new();
+
+    // First version for a new name MUST be 1.
+    s.put_secret(row(&s, "a", 1)).expect("v1 for a new name is accepted");
+
+    // A duplicate version (1 again) is rejected.
+    s.put_secret(row(&s, "a", 1))
+        .expect_err("re-using version 1 violates monotonicity");
+    // A gap (version 3 when max is 1) is rejected.
+    s.put_secret(row(&s, "a", 3))
+        .expect_err("a version gap violates monotonicity");
+    // The exact next version (2) is accepted.
+    s.put_secret(row(&s, "a", 2)).expect("the next version (2) is accepted");
+
+    // The FIRST version for a brand-new name must be 1, not 2 — the contract fires at write time,
+    // not as a later AEAD-open DoS.
+    s.put_secret(row(&s, "b", 2))
+        .expect_err("a new name must start at version 1");
+    s.put_secret(row(&s, "b", 1)).expect("version 1 for a new name is accepted");
+}
+
 // ---- shared-store adapter --------------------------------------------------------------------
 
 /// A `Store` that forwards to a shared `Arc<InMemStore>`, so several `Engine`s in one test can

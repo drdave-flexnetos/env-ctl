@@ -56,13 +56,27 @@ use broker::{
 const META_HEADER_MAC: &str = "vault.header_mac";
 const META_ISSUANCE_FLOOR_MS: &str = "vault.issuance_floor_ms";
 const META_DEK_GENERATION: &str = "vault.dek_generation";
-/// DEK-keyed anchor over the audit chain TAIL (`max_seq` + tail `row_hash`), rewritten on every
-/// successful audit append while the vault is unlocked. The chain itself is unkeyed (its hashes are
-/// public), so a store-level attacker could drop trailing rows and re-link a perfectly clean
-/// shorter chain that `verify_chain` accepts. This anchor binds the EXPECTED tail to the DEK, so a
-/// truncated/rewritten chain is caught by `verify_audit_anchor` (only an unlocked vault can advance
-/// it). Domain-separated; see `audit_head_mac`.
+/// DEK-keyed anchor over the audit chain TAIL (`max_seq` + tail `row_hash`) AND the monotonic
+/// high-water (`META_AUDIT_HIGH_WATER`), rewritten on every successful audit append while the vault
+/// is unlocked. The chain itself is unkeyed (its hashes are public), so a store-level attacker could
+/// drop trailing rows and re-link a perfectly clean shorter chain that `verify_chain` accepts. This
+/// anchor binds the EXPECTED tail AND the highest anchored seq to the DEK; `verify_audit_anchor`
+/// reconstructs the MAC against the row at `seq == high_water` (the tail AS OF the last advance — NOT
+/// the current live tail, which may sit above it after rows were appended while LOCKED) and REJECTS a
+/// live chain whose max-seq is below the high-water (truncation), so a truncated/rewritten chain —
+/// including a stale-anchor replay — is caught (only an unlocked vault can advance it). The full
+/// verification rule lives on `verify_audit_anchor_with`. Domain-separated; see `audit_head_mac`.
 const META_AUDIT_HEAD: &str = "vault.audit_head";
+/// The strictly-non-decreasing high-water of the anchored tail seq, persisted as an `i64` decimal
+/// string through the same plaintext meta KV as `META_AUDIT_HEAD`. It is the rollback FENCE: a
+/// verifier rejects any live chain whose current max-seq is BELOW it (the live chain is shorter than
+/// the highest tail we ever anchored => truncation). It is ALSO folded into `audit_head_mac`, so a
+/// store-level attacker cannot lower the plaintext counter without invalidating the MAC, nor raise
+/// the MAC-bound counter without the DEK. The plaintext copy lets `verify` reject precisely and lets
+/// `advance` enforce monotonicity cheaply; the MAC-bound copy is the unforgeable authority. (Honest
+/// residual: a FULL consistent snapshot rollback that rewinds rows + `META_AUDIT_HEAD` +
+/// `META_AUDIT_HIGH_WATER` in lock-step is NOT detectable in-store — see THREAT-MODEL A2.)
+const META_AUDIT_HIGH_WATER: &str = "vault.audit_high_water";
 
 /// BLAKE3 `derive_key` context for the audit-head anchor key (DEK-keyed, domain-separated from the
 /// header MAC and every other BLAKE3 use in the crate).
@@ -281,14 +295,12 @@ impl Engine {
         )?;
         // Anchor the genesis (`vault_init`) row with the local DEK while it is still alive (the
         // vault is Locked, so the in-`audit` anchor advance was a no-op). This DEK-keys the chain
-        // tail from the very first row.
+        // tail from the very first row and seeds the monotonic high-water at the `vault_init` seq.
         let (seq, tail_hash) = match inner.store.last_audit()? {
             Some(r) => (r.seq, r.row_hash),
             None => (0i64, Vec::new()),
         };
-        inner
-            .store
-            .put_meta(META_AUDIT_HEAD, &hex_encode(&audit_head_mac(&dek, seq, &tail_hash)))?;
+        self.write_audit_anchor(&dek, seq, &tail_hash)?;
 
         // The DEK never leaves this function; it is dropped (zeroized) here. The vault stays Locked
         // until an explicit `unlock`.
@@ -1379,7 +1391,8 @@ impl Engine {
     }
 
     /// If the vault is unlocked, recompute + persist the DEK-keyed anchor over the CURRENT chain
-    /// tail. No-op when locked (no resident DEK to key the anchor with).
+    /// tail, advancing the monotonic high-water. No-op when locked (no resident DEK to key the
+    /// anchor with).
     fn advance_audit_anchor_if_unlocked(&self) -> anyhow::Result<()> {
         let v = self.inner.vault.read().expect("vault lock");
         let Some(dek) = v.dek() else {
@@ -1389,7 +1402,63 @@ impl Engine {
             Some(r) => (r.seq, r.row_hash),
             None => (0i64, Vec::new()),
         };
-        let mac = audit_head_mac(dek, seq, &tail_hash);
+        self.write_audit_anchor(dek, seq, &tail_hash)
+    }
+
+    /// The single monotonic anchor-write choke point (used by both `advance_audit_anchor_if_unlocked`
+    /// and the `init_vault` genesis anchor). Raises the persisted high-water to
+    /// `max(stored_high_water, new_seq)` — a NON-DECREASING fence: a no-op read that did not grow the
+    /// chain can never lower it. In the steady state `high_water == new_seq`.
+    ///
+    /// CRASH WINDOW (M-2 residual, fails CLOSED): the two writes — `META_AUDIT_HIGH_WATER` FIRST
+    /// (`= N`), then the MAC bound to `(N, N, row@N)` — are NOT atomic on the `InMemStore`/single-key
+    /// `put_meta` backend (no multi-key transaction). A crash BETWEEN them persists `high_water = N`
+    /// while the MAC still commits to the previous high-water `N-1` (`MAC@(N-1, N-1, row@(N-1))`). On
+    /// the next unlock, `verify_audit_anchor_with` runs against the honest live chain (`cur_seq = N`):
+    /// the floor passes (`N < N` is false), but step 4 reconstructs `audit_head_mac(dek, N, N, row@N)`,
+    /// which does NOT equal the stored `MAC@(N-1)` => `AuditChainBroken` => the NEXT UNLOCK IS REFUSED.
+    /// So the true worst case is a hard unlock-DoS on an honest vault with NO in-engine recovery path
+    /// (recovery needs an out-of-band re-anchor), NOT a "stale-by-one MAC that still verifies".
+    /// Reversing the write order does not help (the MAC binds `high_water` either way). Security is
+    /// preserved (it fails closed, never falsely PASSES a rolled-back chain). A true fix is a single
+    /// atomic store transaction over the `(high_water, MAC)` pair (the libSQL backend, behind the
+    /// `Store` trait) or persisting both under one `put_meta` blob; for the RAM-only / single-operator
+    /// model this availability cost is the accepted M-2 residual (see THREAT-MODEL §5 A2 / M-2).
+    fn write_audit_anchor(&self, dek: &Dek, new_seq: i64, tail_hash: &[u8]) -> anyhow::Result<()> {
+        let prev_hw: i64 = self
+            .inner
+            .store
+            .get_meta(META_AUDIT_HIGH_WATER)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let high_water = prev_hw.max(new_seq);
+        self.inner
+            .store
+            .put_meta(META_AUDIT_HIGH_WATER, &high_water.to_string())?;
+        // On every advance the live tail is the highest seq in the (only-growing) chain, so
+        // `new_seq >= prev_hw` and `high_water == new_seq`: the anchored position IS the high-water,
+        // and `tail_hash` is the row at it. We bind `high_water` into BOTH MAC seq fields so the
+        // commitment is exactly what `verify_audit_anchor_with` reconstructs (`(hw, hw, row@hw)`),
+        // leaving room in the wire shape (two fields) for a future L-1 locked-append window where the
+        // high-water could exceed the anchored tail.
+        //
+        // SIGNER/VERIFIER AGREEMENT (cross-ref `verify_audit_anchor_with` step 4): the verifier
+        // reconstructs the MAC over the `row_hash` at `seq == high_water`. Here we sign over
+        // `tail_hash` = the row at `new_seq`. They agree ONLY while `high_water == new_seq`. If a
+        // future L-1 locked-append window ever lets `prev_hw > new_seq` (the high-water exceeds the
+        // just-anchored tail), this MUST instead fetch and bind the `row_hash` AT `high_water`, or the
+        // signer (row@new_seq) and verifier (row@high_water) would diverge into a FALSE
+        // `AuditChainBroken` on a legitimate chain. The invariant is asserted in debug so any such
+        // change trips loudly here rather than shipping a silent verifier divergence.
+        debug_assert!(
+            high_water == new_seq,
+            "write_audit_anchor invariant: high_water ({high_water}) must equal the anchored tail \
+             seq ({new_seq}); the verifier reconstructs the MAC over row@high_water (see \
+             verify_audit_anchor_with step 4). A locked-append window that raises high_water above \
+             the anchored tail must bind row@high_water here, not row@new_seq."
+        );
+        let mac = audit_head_mac(dek, high_water, high_water, tail_hash);
+        let _ = new_seq;
         self.inner.store.put_meta(META_AUDIT_HEAD, &hex_encode(&mac))?;
         Ok(())
     }
@@ -1409,15 +1478,41 @@ impl Engine {
     /// Verify the DEK-keyed audit anchor against the live chain using an explicit DEK (so it can be
     /// driven from `unlock` with the just-recovered DEK, before it is committed into the vault).
     ///
-    /// Rule: the unkeyed `verify_chain` must pass (partial-mutation tamper-evidence) AND the stored
-    /// anchor MAC must be reproducible from SOME `(seq, row_hash)` present in the live chain.
-    /// Because the MAC binds the seq, truncating the chain below the anchored seq removes the only
-    /// row that reproduces the anchor (caught), and rewriting any covered row changes its row_hash
-    /// (caught). Rows appended while LOCKED after the anchor (e.g. a failed unlock) sit above the
-    /// anchored seq and are covered only by the forward unkeyed linkage — the documented limit.
+    /// Rule (the H-1 fix):
+    ///   1. the unkeyed `verify_chain` must pass (partial-mutation tamper-evidence);
+    ///   2. read the monotonic high-water (`META_AUDIT_HIGH_WATER`);
+    ///   3. **HIGH-WATER FLOOR** — reject if the live chain's current max-seq is BELOW the high-water
+    ///      (the chain is shorter than the highest tail we ever anchored => truncation);
+    ///   4. **ANCHORED-ROW MATCH** — the stored MAC must equal `audit_head_mac(dek, high_water,
+    ///      high_water, anchored_row_hash)`, where `anchored_row_hash` is the `row_hash` of the row at
+    ///      `seq == high_water` (the tail AS OF the last advance — NOT the current live tail, which
+    ///      may sit above it after rows appended while LOCKED, and NOT "any row in the chain", the
+    ///      defective old rule). `high_water == 0` (empty chain) uses the empty slice. Constant-time
+    ///      compare. SIGNER SIDE: `write_audit_anchor` commits exactly this `(hw, hw, row@hw)` shape;
+    ///      the two agree only while `high_water == anchored tail seq` (a `debug_assert` there guards
+    ///      it). The step-4 compare is the load-bearing half closing covered-row rewrite AND a stale
+    ///      lower-seq MAC replayed while `cur_seq >= high_water` (regression-pinned by
+    ///      `stale_anchor_replay_caught_at_mac_not_floor`).
+    ///
+    /// Why match the row at `seq == high_water` rather than the live tail: `advance` always anchors
+    /// the tail it just observed and sets `high_water == that seq`, so the anchored position IS the
+    /// high-water. Rows appended while LOCKED (init / failed-unlock / lock / unlock markers) only ADD
+    /// rows ABOVE the anchored seq — the anchored row stays present at `seq == high_water` — and the
+    /// post-unlock advance re-anchors to the new tail. The contiguity guaranteed by `verify_chain`
+    /// (1..=cur_seq) plus the floor (`cur_seq >= high_water`) means a row at `seq == high_water`
+    /// always exists when `high_water >= 1`.
+    ///
+    /// Why this catches the stale-anchor replay the old "match any row" rule missed: after honest
+    /// growth to seq N, `advance` raised the high-water (and the MAC) to N. Truncating back to k < N
+    /// rows is rejected at (3) (`cur_max_seq = k < high_water = N`). Restoring an OLD captured anchor
+    /// (high_water = k) WITHOUT also rewinding the plaintext high-water is rejected at (4) (the MAC is
+    /// recomputed against the stored high-water N at row N, so the seq-k MAC won't match). Rewriting
+    /// any covered field of the anchored row changes its `row_hash` and is caught at (4). The ONLY
+    /// in-store-undetectable case is a FULL consistent snapshot rollback (rows + MAC + high-water
+    /// rewound together) — the documented residual (THREAT-MODEL A2; needs off-box anchoring).
     fn verify_audit_anchor_with(&self, dek: &Dek) -> anyhow::Result<()> {
         use subtle::ConstantTimeEq;
-        // The chain itself must verify first (partial-mutation tamper-evidence).
+        // 1. The chain itself must verify first (partial-mutation tamper-evidence).
         self.inner.store.verify_audit_chain()?;
 
         let Some(stored_hex) = self.inner.store.get_meta(META_AUDIT_HEAD)? else {
@@ -1427,19 +1522,39 @@ impl Engine {
         };
         let stored_mac = hex_decode(&stored_hex).ok_or(EngineError::AuditChainBroken(0))?;
 
+        // 2. The high-water is mandatory once an anchor exists; a missing/garbled counter is a broken
+        // chain (the fence was dropped), not a silent pass.
+        let stored_hw: i64 = self
+            .inner
+            .store
+            .get_meta(META_AUDIT_HIGH_WATER)?
+            .ok_or(EngineError::AuditChainBroken(0))?
+            .parse()
+            .map_err(|_| EngineError::AuditChainBroken(0))?;
+
         let rows = self.inner.store.query_audit(0, usize::MAX)?;
-        let matched = if rows.is_empty() {
-            // Empty-chain anchor (seq 0).
-            bool::from(audit_head_mac(dek, 0, &[]).as_slice().ct_eq(&stored_mac))
+        let cur_seq = rows.last().map_or(0i64, |r| r.seq);
+
+        // 3. HIGH-WATER FLOOR: a live chain shorter than the highest anchored tail is a truncation.
+        if cur_seq < stored_hw {
+            return Err(EngineError::AuditChainBroken(cur_seq).into());
+        }
+
+        // 4. ANCHORED-ROW MATCH: reconstruct the anchor against the row AT the high-water seq (the
+        // tail as of the last advance; rows appended while LOCKED sit above it). `verify_chain`
+        // guarantees rows are 1..=cur_seq contiguous, so when `stored_hw >= 1` a row at that seq is
+        // present at index `stored_hw - 1`.
+        let anchored_hash: &[u8] = if stored_hw == 0 {
+            &[]
         } else {
-            rows.iter().any(|r| {
-                bool::from(audit_head_mac(dek, r.seq, &r.row_hash).as_slice().ct_eq(&stored_mac))
-            })
+            match rows.get((stored_hw - 1) as usize) {
+                Some(r) if r.seq == stored_hw => r.row_hash.as_slice(),
+                _ => return Err(EngineError::AuditChainBroken(cur_seq).into()),
+            }
         };
-        if !matched {
-            // The anchored tail is not reproducible from any row in the live chain => the chain was
-            // truncated below the anchor, or a covered row was rewritten.
-            return Err(EngineError::AuditChainBroken(0).into());
+        let expect = audit_head_mac(dek, stored_hw, stored_hw, anchored_hash);
+        if !bool::from(expect.as_slice().ct_eq(&stored_mac)) {
+            return Err(EngineError::AuditChainBroken(cur_seq).into());
         }
         Ok(())
     }
@@ -1596,16 +1711,21 @@ fn random_bytes(n: usize) -> Vec<u8> {
     v
 }
 
-/// DEK-keyed MAC over the audit chain tail `(seq, tail_row_hash)` — the durable anchor that makes
-/// tail-truncation/rewrite detectable (the unkeyed chain alone is only tamper-EVIDENT against
-/// partial mutation). BLAKE3 `keyed_hash` is a 256-bit MAC; the key is derived from the DEK via
-/// BLAKE3 `derive_key` (domain-separated context) so the anchor is unforgeable without the unlocked
-/// DEK and cannot be confused with the header MAC. `tail_row_hash` is the empty slice for an empty
-/// chain (`seq == 0`).
-fn audit_head_mac(dek: &Dek, seq: i64, tail_row_hash: &[u8]) -> Vec<u8> {
+/// DEK-keyed MAC over the audit chain tail `(seq, tail_row_hash)` AND the monotonic `high_water` —
+/// the durable anchor that makes tail-truncation/rewrite AND stale-anchor replay detectable (the
+/// unkeyed chain alone is only tamper-EVIDENT against partial mutation). Folding `high_water` in
+/// makes the MAC a commitment to "the chain has reached AT LEAST `high_water` rows, whose tail at
+/// anchoring time was `(seq, tail_row_hash)`"; for a current anchor `high_water == seq` (they advance
+/// together). BLAKE3 `keyed_hash` is a 256-bit MAC; the key is derived from the DEK via BLAKE3
+/// `derive_key` (domain-separated context) so the anchor is unforgeable without the unlocked DEK and
+/// cannot be confused with the header MAC. Message layout (big-endian ints):
+/// `AUDIT_HEAD_DOMAIN || high_water || seq || tail_row_hash`. `tail_row_hash` is the empty slice for
+/// an empty chain (`seq == 0`).
+fn audit_head_mac(dek: &Dek, high_water: i64, seq: i64, tail_row_hash: &[u8]) -> Vec<u8> {
     let key = blake3::derive_key(AUDIT_HEAD_KEY_INFO, &dek.0);
-    let mut msg = Vec::with_capacity(AUDIT_HEAD_DOMAIN.len() + 8 + tail_row_hash.len());
+    let mut msg = Vec::with_capacity(AUDIT_HEAD_DOMAIN.len() + 16 + tail_row_hash.len());
     msg.extend_from_slice(AUDIT_HEAD_DOMAIN);
+    msg.extend_from_slice(&high_water.to_be_bytes());
     msg.extend_from_slice(&seq.to_be_bytes());
     msg.extend_from_slice(tail_row_hash);
     blake3::keyed_hash(&key, &msg).as_bytes().to_vec()

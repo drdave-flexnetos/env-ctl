@@ -23,6 +23,7 @@
 -- the monotonic issuance_floor_ms (REVIEW FIX OI-6) cross-checked against CLOCK_BOOTTIME on unlock.
 CREATE TABLE meta (
   k TEXT PRIMARY KEY,          -- 'schema_version','vault_id','active_dek_generation','audit_head',
+                               -- 'audit_high_water' (monotonic anchored-tail seq fence; see audit_log),
                                -- 'issuance_floor_ms','last_seen_ms','header_mac','rotation_in_progress','created_at'
   v TEXT NOT NULL
 );
@@ -164,9 +165,21 @@ CREATE TABLE audit_log (
   subject    TEXT,                             -- secret name / policy name / token_id / sni
   detail     TEXT,                             -- JSON; NEVER contains plaintext secret material
   outcome    TEXT NOT NULL,                    -- 'ok'|'refused'|'failed'
-  prev_hash  BLOB NOT NULL,                    -- row_hash of seq-1 (zeroes for seq=1)
-  row_hash   BLOB NOT NULL                     -- BLAKE3(canonical(seq,ts,actor_uid,event_type,subject,detail,outcome) || prev_hash)
+  prev_hash  BLOB NOT NULL,                    -- row_hash of seq-1; for seq=1 it is the DOMAIN-SEPARATED
+                                               -- genesis = BLAKE3("env-ctl/v1/audit-genesis") (NOT zeroes — an
+                                               -- all-zero prev_hash would let an attacker forge an ambiguous
+                                               -- "genesis"; see audit.rs genesis_hash)
+  row_hash   BLOB NOT NULL                     -- BLAKE3(prev_hash || canonical_row), where canonical_row is the
+                                               -- length-prefixed AUDIT_ROW_DOMAIN||seq||ts||actor||event_type||
+                                               -- subject||detail||outcome blob (prev_hash is folded FIRST, before
+                                               -- the row content; matches audit.rs row_hash)
 );
+-- Truncation/rewrite resistance comes from the DEK-keyed tail ANCHOR maintained ABOVE this table by
+-- the engine: meta.audit_head = BLAKE3-keyed-MAC(derive_key(DEK), AUDIT_HEAD_DOMAIN || high_water ||
+-- seq || tail_row_hash), paired with the strictly-non-decreasing meta.audit_high_water. verify
+-- rejects a live chain whose max-seq is below the high-water (truncation) and reconstructs the MAC
+-- against the row at seq==high_water. A full consistent snapshot rollback (rows+anchor+high-water
+-- rewound in lock-step) is NOT detectable in-store — see docs/THREAT-MODEL.md A2.
 
 -- ---- local CA: public cert in clear, CA private key app-encrypted under the DEK ----
 -- CA validity is SHORT (<=90d, auto-renewed) per REVIEW FIX OI-13; key re-sealed on DEK rotation.

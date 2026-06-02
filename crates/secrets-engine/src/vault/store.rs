@@ -240,6 +240,26 @@ impl Store for InMemStore {
         if g.secrets.iter().any(|r| r.row_id == row.row_id) {
             anyhow::bail!("put_secret row_id {} collides with an existing row", row.row_id);
         }
+        // M-1: version-monotonicity. Codify the store contract (the engine computes
+        // `version = max_secret_version + 1` under the write lock): the next version for `row.name`
+        // MUST be `max+1` (or 1 when there is none). A hostile/buggy store-caller that skips, repeats,
+        // or rewinds a version is rejected at WRITE time (earlier, observable) instead of producing a
+        // row that later fails its AEAD open (the AAD is bound to `version`) as a silent open-time DoS.
+        let expected_version = g
+            .secrets
+            .iter()
+            .filter(|r| r.name == row.name)
+            .map(|r| r.version)
+            .max()
+            .map_or(1, |m| m + 1);
+        if row.version != expected_version {
+            anyhow::bail!(
+                "put_secret version {} for {:?} violates monotonicity (expected {})",
+                row.version,
+                row.name,
+                expected_version
+            );
+        }
         let row_id = row.row_id;
         g.secrets.push(row);
         Ok(row_id)
