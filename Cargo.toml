@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/secrets-engine",
+  "crates/secrets-proto",
+  "crates/secretd",
+  "crates/secretctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# ---- shared with envctl on merge (caret-compatible; re-resolves to one unified lockfile) ----
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+anyhow = "1.0"
+thiserror = "2.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+which = "7.0"
+# MERGE NOTE (HF-17): envctl's row is features=["process"]; the merged row MUST union to ["process","net"].
+rustix = { version = "0.38", features = ["process", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- async / network: pulled ONLY by secretd (+ proto/cli); the engine stays sync ----
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "signal", "time", "io-util"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+tower = "0.5"
+hyper = { version = "1.5", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+webpki-roots = "0.26"   # explicit frozen Mozilla roots for upstream egress (never OS store / local CA)
+
+# ---- store: backend behind a Store trait. libSQL is REOPENED (OI-1: it bundles C SQLite). Phase 0
+# ---- ships only the inmem-store impl; the chosen pure-Rust backend lands in Phase 1 per the ruling.
+# (no libsql row — the no-C CI gate `! cargo tree | grep libsql-ffi` must pass)
+
+# ---- crypto (engine; pure-Rust, no C/SQLCipher) ----
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1.5"
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+rand = "0.8"
+getrandom = "0.2"
+
+# ---- TLS / local CA: pin ONE rustls on the RING path (NOT aws-lc-rs) ----
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2.2"
+rustls-pki-types = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+x509-parser = "0.16"
+async-trait = "0.1"
+
+# ---- internal crates ----
+envctl-secrets-engine = { path = "crates/secrets-engine" }
+envctl-secrets-proto  = { path = "crates/secrets-proto" }
+
+[profile.release]
+opt-level = 2
