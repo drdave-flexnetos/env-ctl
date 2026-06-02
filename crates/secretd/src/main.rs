@@ -25,7 +25,7 @@ use std::path::Path;
 use anyhow::Context;
 use envctl_secrets::paths::Paths;
 use envctl_secrets::Engine;
-use envctl_secretd::{peercred, server};
+use envctl_secretd::{config, peercred, server};
 use rustix::process::{setrlimit, Resource, Rlimit};
 
 fn main() -> anyhow::Result<()> {
@@ -63,10 +63,13 @@ async fn serve() -> anyhow::Result<()> {
     ensure_dir_0700(&paths.data)?;
     ensure_dir_0700(&paths.state)?;
 
-    // 4. Open the engine (Arc-backed; Clone + Send + Sync). First-run bootstrap: there is no
-    // `Vault.Init` RPC in the control proto, so a fresh vault stays Locked until an out-of-band
-    // init + an explicit `Lock.Unlock`. We do not auto-init here (no passphrase/USB to enroll).
-    let engine = Engine::open(paths.clone()).context("opening the engine")?;
+    // 4. Select the store backend from config (env > secretd.toml > inmem default) and open the
+    // engine (Arc-backed; Clone + Send + Sync). First-run bootstrap: there is no `Vault.Init` RPC in
+    // the control proto, so a fresh vault stays Locked until an out-of-band init + an explicit
+    // `Lock.Unlock`. We do not auto-init here (no passphrase/USB to enroll).
+    let store_cfg =
+        config::StoreConfig::load(&paths.config_file()).context("loading store config")?;
+    let engine = build_engine(paths.clone(), store_cfg).await?;
 
     // 5. Bind the UDS (reaping a stale socket from a dead daemon), chmod 0600.
     let sock = paths.control_socket();
@@ -97,6 +100,39 @@ async fn serve() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&sock);
     result.context("serving the control plane")?;
     Ok(())
+}
+
+/// Build the engine on the configured store backend (OI-1 (a), Phase 1).
+///
+/// The libSQL store drives its OWN current-thread runtime via `block_on`, so it is constructed on a
+/// `spawn_blocking` thread — NEVER on the async reactor, where a nested `block_on` would panic (see
+/// `secrets-store-libsql/src/sync.rs`). `InMemStore` does no async and is built inline.
+async fn build_engine(paths: Paths, cfg: config::StoreConfig) -> anyhow::Result<Engine> {
+    match cfg.backend {
+        config::Backend::InMem => {
+            tracing::info!("store backend = in-memory (ephemeral; set [store] in secretd.toml for durability)");
+            Engine::open(paths).context("opening the engine on the in-memory store")
+        }
+        config::Backend::LibSql => {
+            let url = cfg
+                .url
+                .expect("resolve() guarantees a URL for the libSQL backend");
+            tracing::info!(url = %url, "store backend = libSQL remote (durable)");
+            let token = cfg.auth_token; // Zeroizing; moved into + dropped by the blocking task
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Engine> {
+                let store = envctl_secrets_store_libsql::LibSqlStoreBuilder::new(
+                    url,
+                    token.as_str().to_owned(),
+                )
+                .build()
+                .context("opening the libSQL remote store (is sqld reachable?)")?;
+                Engine::open_with_store(paths, Box::new(store))
+                    .context("opening the engine on the libSQL store")
+            })
+            .await
+            .context("the libSQL store-construction task panicked")?
+        }
+    }
 }
 
 /// `RLIMIT_CORE=0` (no core dumps that could leak key material) + raise `RLIMIT_MEMLOCK` so a

@@ -16,6 +16,9 @@ path = "src/main.rs"
 [dependencies]
 envctl-secrets-engine = { workspace = true }
 envctl-secrets-proto = { workspace = true }
+# OI-1 (a) / Phase 1: the durable libSQL `remote` store, runtime-selected via config (see config.rs).
+# secretd is the ONLY shipping binary that links the libSQL stack; the engine/proto/cli never do.
+envctl-secrets-store-libsql = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -38,6 +41,9 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 zeroize = { workspace = true }
+# config.rs: parse the optional secretd.toml (store-backend selection). serde derive + toml parser.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # the e2e test (tests/e2e.rs) constructs the engine DIRECTLY (with a fake USB seam so Mint can pass

@@ -80,6 +80,8 @@ async-trait = "0.1"
 # ---- internal crates ----
 envctl-secrets-engine = { path = "crates/secrets-engine" }
 envctl-secrets-proto  = { path = "crates/secrets-proto" }
+# OI-1 (a) / Phase 1: secretd depends on this to runtime-select the durable libSQL `remote` store.
+envctl-secrets-store-libsql = { path = "crates/secrets-store-libsql" }
 
 [profile.release]
 opt-level = 2

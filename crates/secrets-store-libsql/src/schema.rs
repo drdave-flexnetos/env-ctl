@@ -4,13 +4,17 @@
 //! pattern #1).
 
 // --------------------------------------------------------------------------------------------
-// DDL — provisioned once at init under one transaction. The Store only ever sees ciphertext +
-// non-secret metadata, so no column holds plaintext or a DEK. Schema is intentionally a SUBSET of
-// the full DESIGN model sufficient for the Phase-0/1b Store surface (meta, secrets, keyslots,
-// audit, relays, bearers, certs); relay/bearer/cert tables back the engine's default-stub methods.
+// DDL — provisioned at init via libSQL `execute_batch` (a Hrana batch). The Store only ever sees
+// ciphertext + non-secret metadata, so no column holds plaintext or a DEK. Schema is intentionally
+// a SUBSET of the full DESIGN model sufficient for the Phase-0/1b Store surface (meta, secrets,
+// keyslots, audit, relays, bearers, certs); relay/bearer/cert tables back the engine's default-stub
+// methods.
+//
+// NO explicit `BEGIN;`/`COMMIT;`: Hrana (the remote protocol) rejects transaction-control statements
+// as "unsupported statement". Every statement here is idempotent (CREATE TABLE IF NOT EXISTS /
+// INSERT OR IGNORE), so running them as a plain batch is safe to repeat on every startup.
 // --------------------------------------------------------------------------------------------
 pub const DDL: &str = "\
-BEGIN;
 CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
@@ -79,11 +83,7 @@ CREATE TABLE IF NOT EXISTS certs (
   cn         TEXT NOT NULL,
   not_after  TEXT NOT NULL,
   der        BLOB NOT NULL
-);
-COMMIT;";
-
-/// Set at init so every write waits for sqld's disk fsync before the RPC replies (HF-14).
-pub const PRAGMA_SYNCHRONOUS_FULL: &str = "PRAGMA synchronous=FULL";
+);";
 
 /// Dummy round-trip that confirms the connection is live + durable (the `fsync_barrier`).
 pub const FSYNC_BARRIER_PROBE: &str = "SELECT 1";

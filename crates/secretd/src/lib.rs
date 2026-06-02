@@ -5,6 +5,7 @@
 //! these SAME modules so the REAL daemon code — `server::serve`, the `grpc` handlers, `conv`, and the
 //! `peercred::OwnerGuard` interceptor — is under test, not an inline replica.
 pub mod audit;
+pub mod config;
 pub mod conv;
 pub mod grpc;
 pub mod peercred;

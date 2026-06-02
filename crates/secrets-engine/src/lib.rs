@@ -137,12 +137,26 @@ pub struct EgressResp {
 
 impl Engine {
     /// Open an engine backed by the real seams (`SystemClock`, `RealUsbProbe`, ...) and the
-    /// default RAM-backed `InMemStore`. The libSQL-backed store lands later behind the identical
-    /// `Store` trait, so this constructor's shape does not change when it does.
+    /// default RAM-backed `InMemStore`. Equivalent to [`Engine::open_with_store`] with the in-memory
+    /// store; `secretd` selects the durable libSQL store via `open_with_store` (OI-1 (a), Phase 1).
     pub fn open(paths: paths::Paths) -> anyhow::Result<Engine> {
+        Self::open_with_store(paths, Box::new(vault::InMemStore::new()))
+    }
+
+    /// Open an engine backed by the real seams and an operator-selected `store`. The store is the
+    /// ONLY seam that varies between the daemon's two backends (`InMemStore` vs the libSQL-backed
+    /// store, OI-1 (a)); both implement the identical [`vault::Store`] trait, so nothing else changes.
+    ///
+    /// NOTE: the libSQL store drives its own current-thread runtime via `block_on`, so it must be
+    /// CONSTRUCTED off the async reactor (e.g. before entering the tokio runtime, or on a
+    /// `spawn_blocking` thread) — see `secretd`'s bring-up. `open_with_store` itself does no async.
+    pub fn open_with_store(
+        paths: paths::Paths,
+        store: Box<dyn vault::Store>,
+    ) -> anyhow::Result<Engine> {
         Self::with_seams(
             paths,
-            Box::new(vault::InMemStore::new()),
+            store,
             Box::new(SystemClock),
             Box::new(RealUsbProbe),
             Box::new(seam::NoMint),

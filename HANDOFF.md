@@ -12,7 +12,7 @@ daemon; per-client **relay bearers** (≤24h, scoped, peer-bound, revocable, USB
 the real key at egress. Pull the USB = physical kill switch.
 
 ## State (as of this handoff)
-**Core complete, twice-audited, locally runnable. 106 tests green; stable Rust; no C *library* in the
+**Core complete, twice-audited, locally runnable. 117 tests green; stable Rust; no C *library* in the
 trust boundary.** All pushed. **OI-1 RESOLVED (a):** the libSQL `remote` store crate is now a
 workspace member (build-time `cc` accepted — it is already required by ring+blake3; no C *library* is
 linked), with the no-C / single-ring-backend gate materialized + armed at `ci/gates/no-c.sh`.
@@ -33,15 +33,21 @@ linked), with the no-C / single-ring-backend gate materialized + armed at `ci/ga
    toolchain** — verified empirically that the engine ALREADY needs `cc` via **ring** (compiles
    C/asm) **and blake3** (SIMD), so the upheld tenet is *"no C **library** linked in the trust
    boundary"* — proven by `ci/gates/no-c.sh` (no `libsql-ffi`/`libsql-sys`/`sqlite3-sys`, no
-   `aws-lc-*`/`openssl-sys`, exactly one ring-only `rustls`). Workspace builds + **106 tests green**;
+   `aws-lc-*`/`openssl-sys`, exactly one ring-only `rustls`). Workspace builds + **117 tests green**;
    5 sqld integration tests `#[ignore]`d. `lemon.c` is build-time codegen (emits Rust; nothing C
-   linked). **Follow-on (Phase 1):** wire secretd to runtime-select this backend (config = sqld URL +
-   auth token; transport = loopback or TLS) — `Engine::with_seams` already takes `Box<dyn Store>`, so
-   the seam exists. **Residual:** libSQL `remote` pulls a duplicate-major legacy stack (`hyper 0.14`,
-   `http 0.2`, `h2 0.3`, `base64 0.21`, and a 2nd `prost` major `0.12` via `libsql-hrana`) — all
-   pure-Rust, confined to the libsql subtree, linked into nothing shipping. **Target** stays strict
-   C-toolchain-free (blake3 `pure` + a pure-Rust Hrana client). See
-   `crates/secrets-store-libsql/README.md`.
+   linked). **Phase-1 wiring — DONE. ✅** `secretd` runtime-selects the backend via config (env >
+   `secretd.toml` > inmem default; see `docs/ops/08-secretd-store-config.md`); `Engine::open_with_store`
+   injects it behind the `Store` trait; the store is built off-reactor. Proven against a REAL `sqld`:
+   the store's 5 integration tests + a new engine-over-libSQL **durability** e2e (init/unlock/put/get
+   that survives across engine instances) pass. Two real-server fixes that only e2e could catch:
+   (i) libSQL `remote` ships no connector unless its `tls` feature is on (which would add a 2nd rustls),
+   so the store supplies a **plaintext loopback** `HttpConnector` (gate-clean; remote DBs go via a
+   loopback TLS terminator); (ii) Hrana rejects `BEGIN/COMMIT`/`PRAGMA` and expires the idle stream
+   during argon2 — fixed by Hrana-batch DDL + **reconnect-on-`STREAM_EXPIRED`**. **Residual:** the
+   libSQL dup-major stack (`hyper 0.14`, `http 0.2`, `h2 0.3`, `base64 0.21`, 2nd `prost` `0.12`) now
+   **links into `secretd`** (the daemon) when the libsql backend is selected — all pure-Rust, no C
+   library (gate-proven). **Target** stays strict C-toolchain-free (blake3 `pure` + a pure-Rust Hrana
+   client). See `crates/secrets-store-libsql/README.md` + `docs/ops/08-secretd-store-config.md`.
 2. **Remote edge (Phase 8, deferred by design):** the HTTPS + DPoP-sender-bound relay plane for remote
    clients (e.g. a Telegram bot). The SERVER-MODE audit lists exactly what to bridge in (remote
    bearer binding into `decide()`/schema, jti replay store, streaming revocation, public-edge TLS).

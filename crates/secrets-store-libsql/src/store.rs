@@ -17,8 +17,8 @@ use crate::schema;
 use crate::serial;
 use crate::sync::SyncConnection;
 
-/// Builder for [`LibSqlStore`]: collects the remote URL + auth token, opens the connection, sets
-/// `PRAGMA synchronous=FULL`, and provisions the schema.
+/// Builder for [`LibSqlStore`]: collects the remote URL + auth token, opens the connection, and
+/// provisions the schema. Durability is server-side (see [`LibSqlStoreBuilder::build`]).
 pub struct LibSqlStoreBuilder {
     url: String,
     auth_token: String,
@@ -32,19 +32,27 @@ impl LibSqlStoreBuilder {
         }
     }
 
-    /// Open the remote DB, force durable writes, and provision the schema. Returns a ready store.
+    /// Open the remote DB and provision the schema. Returns a ready store.
+    ///
+    /// Durability is the SERVER's responsibility for the remote backend: sqld persists each write to
+    /// its WAL (durable by default), and [`LibSqlStore::fsync_barrier`] (a `SELECT 1` round-trip
+    /// after each write) confirms the prior statement was applied by the server before success is
+    /// reported (HF-14). A client-side `PRAGMA synchronous=FULL` is deliberately NOT issued: Hrana
+    /// rejects `PRAGMA` as an "unsupported statement", and the client cannot set the server's sync
+    /// mode regardless.
     pub fn build(self) -> anyhow::Result<LibSqlStore> {
         let conn = SyncConnection::open_remote(&self.url, &self.auth_token)?;
-        // Durable-write posture (HF-14): every write waits for sqld's disk fsync.
-        conn.execute(schema::PRAGMA_SYNCHRONOUS_FULL, Vec::new())?;
-        // Provision schema. DDL is a multi-statement script, so use execute_batch via the runtime.
+        // Provision the schema as a Hrana batch (idempotent DDL; no explicit BEGIN/COMMIT — see DDL).
         conn.runtime().block_on(async {
-            conn.conn()
-                .execute_batch(schema::DDL)
+            let c = conn.conn();
+            c.execute_batch(schema::DDL)
                 .await
                 .map_err(|e| Error::ExecuteFailed(e.to_string()))
         })?;
-        Ok(LibSqlStore { conn })
+        Ok(LibSqlStore {
+            conn,
+            append_lock: std::sync::Mutex::new(()),
+        })
     }
 }
 
@@ -52,6 +60,13 @@ impl LibSqlStoreBuilder {
 /// shared behind an `Arc` by the engine; all methods take `&self`.
 pub struct LibSqlStore {
     conn: SyncConnection,
+    /// Serializes `append_audit` within this process. The engine audits under only a READ lock, so
+    /// two concurrent RPCs (each on its own `spawn_blocking` thread) could otherwise both read tail
+    /// `seq=N`, both seal `N+1`, and the second INSERT would lose to the `seq` PRIMARY KEY — cleanly
+    /// erroring but DROPPING that security event's row. `InMemStore` holds a Mutex across link+push;
+    /// this is the libSQL analogue (here the read->insert window is a network RTT, so the race is
+    /// wider). Held across read-tail + insert so the chain `seq` can never be computed from a stale tail.
+    append_lock: std::sync::Mutex<()>,
 }
 
 impl LibSqlStore {
@@ -112,33 +127,35 @@ impl Store for LibSqlStore {
 
     fn reserve_secret_row_id(&self) -> anyhow::Result<i64> {
         // Atomic bump-and-read under one transaction so two concurrent reservations can never read
-        // the same next_id (the reserve/assign TOCTOU the trait contract forbids).
-        let conn = self.conn.clone();
-        let id = self.conn.runtime().block_on(async move {
-            let txn = conn
-                .conn()
-                .transaction()
-                .await
-                .map_err(|e| Error::TransactionFailed(e.to_string()))?;
-            txn.execute(schema::INCREMENT_ROW_ID_COUNTER, ())
-                .await
-                .map_err(|e| Error::ExecuteFailed(e.to_string()))?;
-            let mut rows = txn
-                .query(schema::GET_NEXT_ROW_ID, ())
-                .await
-                .map_err(|e| Error::QueryFailed(e.to_string()))?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|e| Error::QueryFailed(e.to_string()))?
-                .ok_or_else(|| Error::QueryFailed("row_id_counter row missing".into()))?;
-            let id = row
-                .get::<i64>(0)
-                .map_err(|e| Error::SerializationError(format!("next_id: {e}")))?;
-            txn.commit()
-                .await
-                .map_err(|e| Error::TransactionFailed(e.to_string()))?;
-            Ok::<i64, Error>(id)
+        // the same next_id (the reserve/assign TOCTOU the trait contract forbids). Via run_retry so a
+        // Hrana stream-expiry reconnects + retries; a stream-expiry means the txn never committed, so
+        // a redo is safe (at worst an id is skipped — ids need only be unique + monotonic, gaps OK).
+        let id = self.conn.run_retry(|conn, rt| {
+            rt.block_on(async {
+                let txn = conn
+                    .transaction()
+                    .await
+                    .map_err(|e| Error::TransactionFailed(e.to_string()))?;
+                txn.execute(schema::INCREMENT_ROW_ID_COUNTER, ())
+                    .await
+                    .map_err(|e| Error::ExecuteFailed(e.to_string()))?;
+                let mut rows = txn
+                    .query(schema::GET_NEXT_ROW_ID, ())
+                    .await
+                    .map_err(|e| Error::QueryFailed(e.to_string()))?;
+                let row = rows
+                    .next()
+                    .await
+                    .map_err(|e| Error::QueryFailed(e.to_string()))?
+                    .ok_or_else(|| Error::QueryFailed("row_id_counter row missing".into()))?;
+                let id = row
+                    .get::<i64>(0)
+                    .map_err(|e| Error::SerializationError(format!("next_id: {e}")))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| Error::TransactionFailed(e.to_string()))?;
+                Ok::<i64, Error>(id)
+            })
         })?;
         Ok(id)
     }
@@ -147,10 +164,12 @@ impl Store for LibSqlStore {
         // Contract checks (mirror InMemStore): row_id must have been reserved (1..=next_id) and not
         // collide, and version must be max+1 for the name (M-1 monotonicity). All under ONE txn so
         // the read-validate-insert is atomic.
-        let conn = self.conn.clone();
-        let row_id = self.conn.runtime().block_on(async move {
+        // Via run_retry so a Hrana stream-expiry reconnects + retries. In the (extremely rare) case a
+        // commit succeeded but its ack was lost to an expiry, the retry hits the collision/version
+        // check and returns a clean Contract error rather than double-inserting.
+        let row_id = self.conn.run_retry(|conn, rt| {
+            rt.block_on(async {
             let txn = conn
-                .conn()
                 .transaction()
                 .await
                 .map_err(|e| Error::TransactionFailed(e.to_string()))?;
@@ -219,6 +238,7 @@ impl Store for LibSqlStore {
                 .await
                 .map_err(|e| Error::TransactionFailed(e.to_string()))?;
             Ok::<i64, Error>(row.row_id)
+            })
         })?;
         self.fsync_barrier()?;
         Ok(row_id)
@@ -313,8 +333,11 @@ impl Store for LibSqlStore {
     // ---- audit (hash-chained, durable append-only) ----
 
     fn append_audit(&self, rec: &AuditRecord) -> anyhow::Result<i64> {
-        // Link against the current tail with the engine's shared chain math, insert, then HF-14:
-        // confirm durability with fsync_barrier BEFORE returning the seq.
+        // Serialize appenders in-process (the InMemStore-atomicity analogue): hold the lock across
+        // read-tail + insert so two concurrent appends can't seal the same `seq` from a stale tail
+        // and drop a row. Each store call still routes through run_retry (reconnect-on-expiry); the
+        // `SELECT 1` fsync_barrier confirms the server APPLIED the insert (durability is server-side).
+        let _guard = self.append_lock.lock().expect("append_lock poisoned");
         let tail = self.last_audit()?;
         let sealed = audit::link_row(tail.as_ref(), rec.clone());
         let seq = sealed.seq;

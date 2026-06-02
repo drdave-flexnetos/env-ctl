@@ -1,11 +1,14 @@
-//! Store health probe. The daemon gates startup on this: the remote store must be reachable, the
-//! schema present, and (in production) the connection durable.
+//! Store health probe: the remote store is reachable and the schema is provisioned. (`secretd`
+//! proves both as a side effect of opening the store — `LibSqlStoreBuilder::build` connects and runs
+//! the schema batch, so a dead/unschemaed sqld fails startup; `health()` is the explicit probe.)
 
 /// Snapshot of a libSQL store's health, returned by `LibSqlStore::health`.
 #[derive(Debug, Clone)]
 pub struct StoreHealth {
-    /// Writes wait for sqld disk fsync (`PRAGMA synchronous=FULL` set at init + a confirmed
-    /// `fsync_barrier`). Required before the store is allowed to serve security RPCs (HF-14).
+    /// True if the store is reachable and the server APPLIED the prior statement — a `SELECT 1`
+    /// `fsync_barrier` round-trip on the (sequential) Hrana stream. Durability is sqld SERVER-side
+    /// (WAL, durable by default); the client does NOT set or verify a disk fsync (Hrana rejects
+    /// `PRAGMA synchronous=FULL`). The barrier confirms server application before success (HF-14).
     pub durable: bool,
     /// `meta.schema_version` as read back from the store (0 if absent / not initialized).
     pub schema_version: u32,

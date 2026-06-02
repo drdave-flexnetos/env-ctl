@@ -37,9 +37,16 @@ fn store() -> envctl_secrets_store_libsql::LibSqlStore {
 #[ignore = "requires a running sqld; see module docs for how to run"]
 fn meta_roundtrip() {
     let s = store();
-    assert_eq!(s.get_meta("schema_version").unwrap(), None);
-    s.put_meta("schema_version", "1").unwrap();
-    assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("1"));
+    // Use a key NO other test writes (the suite shares one sqld DB; `schema_version` is also set by
+    // `health_reports_durable_after_init`, so asserting it pristine here is order-dependent). The
+    // suite expects a fresh throwaway DB per run; this key keeps meta_roundtrip order-independent.
+    let key = "meta_roundtrip_probe";
+    assert_eq!(s.get_meta(key).unwrap(), None);
+    s.put_meta(key, "1").unwrap();
+    assert_eq!(s.get_meta(key).unwrap().as_deref(), Some("1"));
+    // INSERT OR REPLACE overwrites in place.
+    s.put_meta(key, "2").unwrap();
+    assert_eq!(s.get_meta(key).unwrap().as_deref(), Some("2"));
 }
 
 #[test]
@@ -130,7 +137,7 @@ fn health_reports_durable_after_init() {
     let s = store();
     s.put_meta("schema_version", "1").unwrap();
     let h = s.health().unwrap();
-    assert!(h.durable, "synchronous=FULL + barrier => durable");
+    assert!(h.durable, "a confirmed server-applied barrier => durable");
     assert_eq!(h.schema_version, 1);
     assert!(h.is_healthy());
 }

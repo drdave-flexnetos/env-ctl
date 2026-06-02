@@ -7,11 +7,12 @@ only ever moves opaque blobs + non-secret metadata.
 
 ## STATUS: ADOPTED — a `[workspace.members]` entry (OI-1 RESOLVED (a))
 
-This crate **compiles, its 9 offline unit tests pass under the unified workspace (106 total green),
+This crate **compiles, its 9 offline unit tests pass under the unified workspace (117 total green),
 and its `Store` impl is complete.** As of **OI-1 RESOLVED (a)** it is a **member of the root
 `env-ctl` workspace**: the standalone `[workspace]` table was removed and its deps are
-workspace-pinned. The engine default store stays `inmem-store`; **secretd runtime selection of this
-backend is the Phase-1 follow-on.** The C-purity reasoning that justified adoption is below.
+workspace-pinned. The engine default store stays `inmem-store`; **secretd now runtime-selects this
+backend via config (Phase-1 DONE; see `docs/ops/08-secretd-store-config.md`).** The C-purity
+reasoning that justified adoption is below.
 
 ## C-purity gate (audit F1)
 
@@ -103,17 +104,23 @@ trust boundary"** (no SQLite/OpenSSL/aws-lc). Under that tenet libSQL `remote` i
 - libSQL `remote` drags in a duplicate-major legacy stack confined to its subtree: `hyper 0.14`
   (vs the workspace's `1.x`), `http 0.2`, `http-body 0.4`, `h2 0.3`, `base64 0.21`, `itertools 0.12`,
   and a **2nd `prost` major** (`0.12` via `libsql-hrana`, vs the workspace's `0.13`). All pure-Rust,
-  linked into no shipping binary — dependency duplication (bloat), not a C/gate violation. Revisit on
+  now linked into `secretd` when the libsql backend is selected (Phase-1 wiring done; the
+  engine/proto/cli never link it) — dependency duplication (bloat), not a C/gate violation. Revisit on
   a libSQL bump.
-- The production sqld transport must be loopback or TLS (the integration tests use plaintext
-  `http://127.0.0.1` for TEST ONLY). secretd runtime wiring + transport hardening is Phase 1.
+- **Transport (Phase-1 done):** the store uses a PLAINTEXT loopback `HttpConnector` — libSQL's `tls`
+  feature would pull `hyper-rustls 0.25 → rustls 0.22`, a SECOND rustls (gate violation), and there is
+  no hyper-0.14 hyper-rustls on rustls 0.23. So the URL must be a LOOPBACK sqld; a remote DB goes
+  behind a loopback TLS terminator (stunnel/spiped). The store reconnects on a Hrana `STREAM_EXPIRED`
+  (the idle baton dies during the argon2 gap in `init_vault`). See
+  `docs/ops/08-secretd-store-config.md`.
 - **Known advisory (accepted): CVE-2025-47736 / GHSA-8m95-fffc-h4c5** — `libsql-sqlite3-parser`
   `<= 0.13.0` (the lemon-rs SQL parser) can crash (panic/DoS) on **invalid-UTF-8 SQL text**. **No
   patched release exists** (0.13.0 is the latest on crates.io; the fix is unreleased upstream in
   `gwenn/lemon-rs`). **Not reachable here:** this crate executes ONLY static, constant SQL (see
   `schema.rs`); every user/row value is a bound `?` parameter, never concatenated into query text — so
   no attacker-controlled bytes reach the parser as SQL grammar. Impact is a crash, not memory
-  unsafety; the crate is also a not-yet-wired orphan. Re-evaluate when a patched `libsql`/parser ships.
+  unsafety; the crate is wired into `secretd` but the parser path remains unreached. Re-evaluate when
+  a patched `libsql`/parser ships.
 
 ### Target (the standing goal)
 
@@ -128,10 +135,12 @@ C-SQLite path stays forbidden regardless.
 - **No dynamic SQL:** every statement is a pre-defined parameterized constant in `schema.rs`; all
   row/user values are bound to `?` placeholders (`serial.rs`).
 - **Ciphertext in, opaque out:** the store never decrypts or inspects blobs.
-- **Durable audit (HF-14):** `append_audit` links the row with the engine's shared chain math
-  (`vault::audit::link_row`), inserts it, then calls `fsync_barrier()` (a `SELECT 1` round-trip
-  against a `synchronous=FULL` connection) before returning the `seq`. `verify_audit_chain` reuses
-  `vault::audit::verify_chain` so this backend can never disagree with `InMemStore`.
+- **Durable audit (HF-14):** `append_audit` holds an in-process lock across read-tail + insert (the
+  `InMemStore`-atomicity analogue, so two concurrent appends can't seal the same `seq` and drop a
+  row), links the row with the engine's shared chain math (`vault::audit::link_row`), inserts it, then
+  calls `fsync_barrier()` (a `SELECT 1` round-trip that confirms the server APPLIED the insert —
+  durability is sqld server-side; no client `PRAGMA`) before returning the `seq`. `verify_audit_chain`
+  reuses `vault::audit::verify_chain` so this backend can never disagree with `InMemStore`.
 - **Row-id authority:** `reserve_secret_row_id` is an atomic `UPDATE … +1; SELECT` under one
   transaction; `put_secret` validates reservation + collision + version-monotonicity under one
   transaction (mirrors the `InMemStore` contract).

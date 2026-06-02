@@ -50,6 +50,11 @@ impl Paths {
     pub fn control_socket(&self) -> PathBuf {
         self.runtime.join("secretd.sock")
     }
+    /// The daemon's runtime config file (`~/.config/env-ctl/secretd.toml`): store-backend selection
+    /// and libSQL connection params (OI-1 (a), Phase 1). Optional — absent => in-memory defaults.
+    pub fn config_file(&self) -> PathBuf {
+        self.config.join("secretd.toml")
+    }
     pub fn log_file(&self) -> PathBuf {
         self.state.join("env-ctl.log")
     }

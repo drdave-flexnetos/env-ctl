@@ -34,6 +34,14 @@ tracing = { workspace = true }
 # remote-only libSQL client (pinned in root [workspace.dependencies], OI-1 RESOLVED (a)):
 # `default-features=false, features=["remote"]` — no linked C-SQLite; see this crate's header + README.
 libsql = { workspace = true }
+# Plaintext HTTP connector for the libSQL `remote` client. libSQL's `remote` feature ships NO
+# connector unless its `tls` feature is enabled — and that `tls` feature pulls hyper-rustls 0.25 ->
+# rustls 0.22, a SECOND rustls major (the workspace pins one ring-only rustls 0.23). We deliberately
+# avoid that to keep Gate 4 (single ring-only rustls) green, and instead supply this plaintext
+# connector. This is the SAME legacy hyper 0.14 libSQL's client already uses (no new major). Result:
+# LOOPBACK sqld only; for a remote DB, front it with a loopback TLS terminator (stunnel/spiped). See
+# README + DESIGN-NOTES OI-1. Pure-Rust; no C library.
+hyper = { version = "0.14", default-features = false, features = ["client", "tcp"] }
 
 [features]
 # `remote` is the ONLY supported wiring (pure HTTP/Hrana, no C-SQLite `core`). `embedded` is a

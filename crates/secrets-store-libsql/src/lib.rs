@@ -15,7 +15,8 @@
 //! nothing C is linked). That build-time `cc` is ACCEPTED under decision (a): it is already
 //! mandatory for the engine via ring + blake3. The upheld tenet is "no C *library* in the trust
 //! boundary," and this crate is now a `[workspace.members]` entry, gated by `ci/gates/no-c.sh`
-//! (Gate 3a). Engine default store stays `inmem-store`; secretd runtime selection is Phase 1.
+//! (Gate 3a). Engine default store stays `inmem-store`; secretd runtime-selects this backend via
+//! config (Phase 1 DONE; see `docs/ops/08-secretd-store-config.md`).
 
 #![deny(unsafe_code)]
 
