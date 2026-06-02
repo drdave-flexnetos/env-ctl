@@ -43,8 +43,12 @@ pub struct Kek(pub [u8; 32]);
 pub enum Factor {
     Usb,
     Passphrase,
-    /// Opt-in true 2FA (both factors required to unwrap) (CF-3).
-    RequireBoth,
+    // NOTE (CF-3): a `RequireBoth` "true 2FA" factor was REMOVED. The unlock state machine only
+    // ever selects `Passphrase`/`Usb` slots, so a `RequireBoth` slot was unreachable by every
+    // unlock path and there was no code requiring BOTH factors before committing `Unlocked` — its
+    // dual-control guarantee would have been purely nominal. It must not be re-added until unlock
+    // actually unwraps under a KEK that combines both factor KEKs and refuses single-factor
+    // presentation; otherwise enrolling it silently misrepresents the security contract.
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +114,8 @@ fn factor_byte(f: Factor) -> u8 {
     match f {
         Factor::Usb => 0x01,
         Factor::Passphrase => 0x02,
-        Factor::RequireBoth => 0x03,
+        // 0x03 was Factor::RequireBoth (removed; see the Factor enum). The wire bytes for the
+        // remaining factors are unchanged, so existing keyslots stay readable.
     }
 }
 
