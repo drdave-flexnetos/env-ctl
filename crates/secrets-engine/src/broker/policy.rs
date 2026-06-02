@@ -12,9 +12,18 @@ pub enum Provider {
 }
 
 /// Canonical upstream host allowlist per provider (HF-11) — the swap REFUSES any other host, so a
-/// relay can never be re-pointed at an attacker-controlled endpoint.
-pub fn canonical_upstreams(_p: Provider) -> &'static [&'static str] {
-    todo!()
+/// relay can never be re-pointed at an attacker-controlled endpoint. This is a hard-coded, frozen
+/// fence: even a tampered `host_allow` that lists an attacker host is still rejected because the
+/// host must ALSO be in this provider-pinned set. `Generic` returns the empty slice, so a `Generic`
+/// relay is `UpstreamNotAllowed` by default (default-deny posture) unless the daemon supplies a
+/// per-policy upstream above this trait.
+pub fn canonical_upstreams(p: Provider) -> &'static [&'static str] {
+    match p {
+        Provider::Anthropic => &["api.anthropic.com"],
+        Provider::Openai => &["api.openai.com"],
+        Provider::Github => &["api.github.com", "uploads.github.com"],
+        Provider::Generic => &[],
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +71,14 @@ pub struct RelayPolicy {
     pub method_allow: Vec<Method>,
     pub policy_ttl_secs: i64,
     pub rate_per_min: Option<u32>,
-    pub quota_total: Option<u64>,
+    /// Max TOTAL request COUNT over the bearer's life (the request budget). Distinct scale from the
+    /// byte budget below: one scalar cannot sensibly cap both a request count and a byte count
+    /// (1_000_000 means "1M requests" here, not "1 MB of egress"). `None` => no request cap.
+    #[serde(default, alias = "quota_total")]
+    pub quota_total_requests: Option<u64>,
+    /// Max TOTAL egress BYTES over the bearer's life (the byte budget). `None` => no byte cap.
+    #[serde(default)]
+    pub quota_total_bytes: Option<u64>,
     pub enabled: bool,
     pub revoked: bool,
 }

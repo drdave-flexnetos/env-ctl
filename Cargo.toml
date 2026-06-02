@@ -23,8 +23,10 @@ thiserror = "2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 which = "7.0"
-# MERGE NOTE (HF-17): envctl's row is features=["process"]; the merged row MUST union to ["process","net"].
-rustix = { version = "0.38", features = ["process", "net"] }
+# MERGE NOTE (HF-17): envctl's row is features=["process"]; the merged row MUST union to
+# ["process","net","time"] — `time` adds CLOCK_BOOTTIME (clock_gettime) for the OI-6 monotonic
+# clock-rollback fence on the 24h relay window. All three are pure-Rust on Linux (no C dep).
+rustix = { version = "0.38", features = ["process", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

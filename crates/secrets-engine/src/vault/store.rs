@@ -46,6 +46,16 @@ pub struct RelayPolicyRow {
     pub policy: crate::broker::RelayPolicy,
 }
 
+/// A persisted relay bearer. Only the keyed `mac` (over the wire string) AND the keyed `row_mac`
+/// (over the security-critical metadata) authenticate this row — the raw bearer is NEVER stored.
+///
+/// `mac` binds the opaque wire string; `row_mac` (a DEK-keyed `blake3::keyed_hash` over
+/// `bearer_row_mac_message`) binds every field `decide` trusts (`revoked`, `expires_at_ms`,
+/// `issued_at_ms`, `issued_boottime_ms`, `policy_id`, `client_uid`, `client_pid`). Without it a
+/// store-level attacker could flip `revoked`, raise the expiry, rewrite the peer binding, or repoint
+/// `policy_id` and still pass the wire MAC (which never sees those fields) — reaching `Allow`. The
+/// engine recomputes `row_mac` on every legitimate write (mint AND revoke, DEK live) and re-verifies
+/// it before the pure decision; a tamper fails closed (treated as `UnknownBearer`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BearerRow {
     pub token_id: String,
@@ -53,9 +63,15 @@ pub struct BearerRow {
     pub mac: Vec<u8>,
     pub expires_at_ms: i64,
     pub issued_at_ms: i64,
+    /// `CLOCK_BOOTTIME` snapshot (ms) captured at mint — the monotonic anchor that fences a
+    /// wall-clock rollback resurrecting an expired/within-window bearer (OI-6). Bound into `row_mac`.
+    pub issued_boottime_ms: i64,
     pub client_uid: Option<u32>,
     pub client_pid: Option<u32>,
     pub revoked: bool,
+    /// DEK-keyed MAC over `bearer_row_mac_message(..)` of the fields above. Authenticates the
+    /// clear-text row state so a store-level tamper cannot forge an `Allow`.
+    pub row_mac: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,6 +142,11 @@ pub trait Store: Send + Sync {
     }
     fn load_bearer(&self, _token_id: &str) -> anyhow::Result<Option<BearerRow>> {
         Ok(None)
+    }
+    /// Every bearer (revoked or not) hanging off `relay_id`'s policy. Used by the dry-run revoke to
+    /// count what WOULD be revoked without mutating. Default-empty for stub backends.
+    fn list_bearers_for_relay(&self, _relay_id: &str) -> anyhow::Result<Vec<BearerRow>> {
+        Ok(Vec::new())
     }
     fn revoke_bearers_for_relay(&self, _relay_id: &str) -> anyhow::Result<u32> {
         Ok(0)
@@ -326,12 +347,22 @@ impl Store for InMemStore {
 
     fn save_relay_policy(&self, row: RelayPolicyRow) -> anyhow::Result<i64> {
         let mut g = self.inner.lock().map_err(|_| lock_poisoned())?;
-        let id = if row.id == 0 {
-            (g.relays.len() as i64) + 1
-        } else {
+        // Upsert by relay_id. Re-minting a Named relay MUST reuse the SAME row id (the bearer
+        // linkage key) — its live bearers carry that policy_id, so reassigning it would orphan them.
+        // An `id == 0` caller asks the store to assign: reuse the existing id on upsert, else mint a
+        // fresh monotonic id (max existing + 1, so an upsert can never collide with a live id).
+        let existing_id = g
+            .relays
+            .iter()
+            .find(|r| r.policy.relay_id == row.policy.relay_id)
+            .map(|r| r.id);
+        let id = if row.id != 0 {
             row.id
+        } else if let Some(eid) = existing_id {
+            eid
+        } else {
+            g.relays.iter().map(|r| r.id).max().unwrap_or(0) + 1
         };
-        // Upsert by relay_id.
         if let Some(existing) = g
             .relays
             .iter_mut()
@@ -371,6 +402,24 @@ impl Store for InMemStore {
     fn load_bearer(&self, token_id: &str) -> anyhow::Result<Option<BearerRow>> {
         let g = self.inner.lock().map_err(|_| lock_poisoned())?;
         Ok(g.bearers.iter().find(|b| b.token_id == token_id).cloned())
+    }
+
+    fn list_bearers_for_relay(&self, relay_id: &str) -> anyhow::Result<Vec<BearerRow>> {
+        let g = self.inner.lock().map_err(|_| lock_poisoned())?;
+        let Some(policy_id) = g
+            .relays
+            .iter()
+            .find(|r| r.policy.relay_id == relay_id)
+            .map(|r| r.id)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(g
+            .bearers
+            .iter()
+            .filter(|b| b.policy_id == policy_id)
+            .cloned()
+            .collect())
     }
 
     fn revoke_bearers_for_relay(&self, relay_id: &str) -> anyhow::Result<u32> {
@@ -453,5 +502,16 @@ impl InMemStore {
     pub fn tamper_meta(&self, k: &str, v: &str) {
         let mut g = self.inner.lock().expect("meta tamper lock");
         g.meta.insert(k.to_string(), v.to_string());
+    }
+
+    /// Mutate a stored `BearerRow` IN PLACE without recomputing its DEK-keyed `row_mac`, modeling a
+    /// store-level attacker who edits the clear-text bearer metadata (un-revoke, extend expiry,
+    /// rewrite the peer binding, repoint the policy_id). The row-MAC verify on the swap path must
+    /// reject this as `UnknownBearer`. Used by the bearer-row authenticity regression test.
+    pub fn tamper_bearer(&self, token_id: &str, edit: impl FnOnce(&mut BearerRow)) {
+        let mut g = self.inner.lock().expect("bearer tamper lock");
+        if let Some(b) = g.bearers.iter_mut().find(|b| b.token_id == token_id) {
+            edit(b);
+        }
     }
 }

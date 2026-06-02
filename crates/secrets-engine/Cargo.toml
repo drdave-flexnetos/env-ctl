@@ -43,3 +43,8 @@ rcgen = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
 # the one async seam
 async-trait = { workspace = true }
+
+[dev-dependencies]
+# Pure-Rust executor to drive the single async method (`relay_swap`) from sync integration tests via
+# `block_on`. NO runtime in [dependencies]; tokio stays banned from the engine crate.
+futures-executor = "0.3"

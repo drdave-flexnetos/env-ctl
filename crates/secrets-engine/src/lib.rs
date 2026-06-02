@@ -44,7 +44,13 @@ use keyslot::{
     ARGON2_M_KIB_FLOOR, ARGON2_T_COST_FLOOR,
 };
 use vault::aad::{record_aad, TableTag};
-use vault::store::SecretRow;
+use vault::store::{BearerRow, RelayPolicyRow, SecretRow};
+
+use broker::{
+    bearer_row_mac_message, broker_hmac_key, broker_row_mac_key, canonical_upstreams, decide,
+    mac_bearer, mac_bearer_row, parse_bearer, verify_bearer, verify_bearer_row, CanonRequest,
+    VerifiedBearer,
+};
 
 // Meta keys for the vault header (non-secret; persisted plaintext through the Store).
 const META_HEADER_MAC: &str = "vault.header_mac";
@@ -145,7 +151,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 paths,
                 vault: RwLock::new(vault::Vault::Locked),
-                broker: RwLock::new(broker::Broker),
+                broker: RwLock::new(broker::Broker::default()),
                 ca: RwLock::new(None),
                 store,
                 clock,
@@ -634,43 +640,650 @@ impl Engine {
     }
 
     /// USB-possession-gated, `<=24h`, peer-bound.
+    ///
+    /// Mints a fresh wire bearer (`evrelay_{token_id}_{secret}`) against `spec`, persisting ONLY its
+    /// keyed MAC (`BearerRow.mac`); the raw bearer is returned to the caller and NEVER stored,
+    /// audited, or emitted. USB possession is proven before any key material is touched (HF-14: the
+    /// refusal writes its durable `Refused` row + `GuardRefused` event BEFORE returning). The TTL is
+    /// clamped to `<=24h` through the single `clamp_ttl` choke point.
     pub fn relay_mint(
         &self,
-        _spec: RelayPolicy,
-        _requested_ttl_secs: i64,
-        _peer_uid: Option<u32>,
-        _peer_pid: Option<u32>,
-        _sink: &EventSink,
+        spec: RelayPolicy,
+        requested_ttl_secs: i64,
+        peer_uid: Option<u32>,
+        peer_pid: Option<u32>,
+        sink: &EventSink,
     ) -> anyhow::Result<Bearer> {
-        todo!()
+        let inner = &self.inner;
+        let now_ms = inner.clock.now().timestamp_millis();
+        // Monotonic anchor captured at mint (OI-6): the rollback fence in `decide` measures elapsed
+        // lifetime against THIS, not the rewindable wall clock. It is bound into the row MAC.
+        let issued_boottime_ms = inner.clock.boottime_ms();
+
+        // Hold the vault READ lock for the whole mint so the DEK cannot be zeroized out from under
+        // us between the gate check and the MAC.
+        let v = inner.vault.read().expect("vault lock");
+        let dek = match v.dek() {
+            Some(d) => d,
+            None => return Err(EngineError::Locked.into()),
+        };
+
+        // USB-GATE (HF-14): prove possession of the keyfile backing an enabled USB keyslot BEFORE
+        // touching any key material. A UUID match alone is not possession (CF-4) — `keyfile_for`
+        // must actually return the bytes. Absence is a REFUSAL (durable Refused row + GuardRefused
+        // event), then a typed `UsbAbsent` Err; the real key is never derived.
+        if !self.usb_possession_proven()? {
+            drop(v);
+            self.refuse(sink, "relay_mint", &spec.relay_id, "usb possession not proven")?;
+            return Err(EngineError::UsbAbsent.into());
+        }
+
+        // TTL CLAMP (HF-15): the single choke point min()'s requested vs policy_ttl vs the 24h
+        // ceiling (all in SECONDS, where `MAX_BEARER_TTL_SECS` lives) and refuses a dead/negative
+        // TTL. `clamp_ttl(now_secs, ...)` returns the absolute expiry in the SAME unit, so we feed it
+        // epoch-seconds and convert the result back to the millis the bearer row stores.
+        let now_secs = now_ms.div_euclid(1000);
+        let expires_at_secs = match clamp_ttl(now_secs, spec.policy_ttl_secs, requested_ttl_secs) {
+            Some(e) => e,
+            None => {
+                drop(v);
+                self.refuse(sink, "relay_mint", &spec.relay_id, "ttl clamp refused (non-positive)")?;
+                anyhow::bail!("relay_mint refused: clamped TTL is non-positive");
+            }
+        };
+        let expires_at_ms = expires_at_secs.saturating_mul(1000);
+
+        // Resolve / generate the relay_id. Ephemeral relays own a fresh generated id when blank.
+        let mut spec = spec;
+        if matches!(spec.kind, RelayKind::Ephemeral) && spec.relay_id.is_empty() {
+            spec.relay_id = format!("eph_{}", hex_encode(&random_bytes(8)));
+        }
+
+        // Persist the policy (upsert by relay_id; the assigned id IS the bearer linkage key).
+        let policy_id = inner.store.save_relay_policy(RelayPolicyRow {
+            id: 0,
+            policy: spec.clone(),
+        })?;
+
+        // MINT the raw bearer from the OS CSPRNG. token_id is a public, opaque index (lowercase
+        // hex, no separator char); secret is the actual 32-byte authenticator (base64url-no-pad).
+        let token_id = hex_encode(&random_bytes(16));
+        let secret = b64url_nopad(&random_bytes(32));
+        let raw = Zeroizing::new(format!("{}{}_{}", broker::BEARER_PREFIX, token_id, secret));
+
+        // MAC the WHOLE wire string under the DEK-derived bearer key (Zeroizing, dropped at scope
+        // end). We persist ONLY the MAC — the raw bearer never touches disk.
+        let hmac_key = broker_hmac_key(dek);
+        let mac = mac_bearer(&hmac_key, &raw);
+        drop(hmac_key);
+
+        // Authenticate the clear-text row metadata with a SEPARATE DEK-keyed MAC (CRITICAL fix). This
+        // binds `revoked`/`expires_at_ms`/`issued_at_ms`/`issued_boottime_ms`/`policy_id`/peer ids, so
+        // a store-level attacker cannot flip any of them to forge an Allow — the swap path re-verifies
+        // this before `decide`, and a tamper fails closed (UnknownBearer).
+        let row_mac_key = broker_row_mac_key(dek);
+        let row_mac = mac_bearer_row(
+            &row_mac_key,
+            &bearer_row_mac_message(
+                &token_id,
+                policy_id,
+                expires_at_ms,
+                now_ms,
+                issued_boottime_ms,
+                peer_uid,
+                peer_pid,
+                false,
+            ),
+        );
+        drop(row_mac_key);
+
+        inner.store.save_bearer(BearerRow {
+            token_id: token_id.clone(),
+            policy_id,
+            mac: mac.to_vec(),
+            expires_at_ms,
+            issued_at_ms: now_ms,
+            issued_boottime_ms,
+            client_uid: peer_uid,
+            client_pid: peer_pid,
+            revoked: false,
+            row_mac: row_mac.to_vec(),
+        })?;
+
+        // Release the vault lock BEFORE the audit store write (never hold a lock across a store write
+        // that takes its own lock).
+        drop(v);
+
+        let expires_at = ms_to_rfc3339(expires_at_ms);
+        // Durable audit BEFORE return WITHOUT the bearer; only the public token_id appears.
+        self.audit_ok(
+            sink,
+            "relay_minted",
+            Some(spec.relay_id.clone()),
+            serde_json::json!({
+                "token_id": token_id,
+                "kind": spec.kind,
+                "expires_at_ms": expires_at_ms,
+            }),
+        )?;
+        sink.emit(SecretEvent::RelayMinted {
+            relay: spec.relay_id.clone(),
+            kind: spec.kind,
+            expires_at: expires_at.clone(),
+        });
+
+        Ok(Bearer {
+            relay_id: spec.relay_id,
+            token_id,
+            raw,
+            expires_at,
+        })
     }
-    /// Fail-closed; returns the count of bearers/policies flipped (HF-16).
+    /// Fail-closed; returns the count of bearers/policies flipped (HF-16). When `apply`, the relay
+    /// policy is marked `revoked` AND every live bearer hanging off it is revoked; a store error is
+    /// an `Err` (the revoke must NOT silently no-op). When `!apply` (dry-run) the count that WOULD be
+    /// revoked is returned without mutating. The durable audit row is written BEFORE returning.
     pub fn relay_revoke(
         &self,
-        _relay_id: &str,
-        _apply: bool,
-        _sink: &EventSink,
+        relay_id: &str,
+        apply: bool,
+        sink: &EventSink,
     ) -> anyhow::Result<u32> {
-        todo!()
+        let inner = &self.inner;
+
+        if !apply {
+            // Dry-run: count the live bearers that WOULD be revoked, mutate nothing.
+            let would = inner
+                .store
+                .list_bearers_for_relay(relay_id)?
+                .into_iter()
+                .filter(|b| !b.revoked)
+                .count() as u32;
+            self.audit_ok(
+                sink,
+                "relay_revoked",
+                Some(relay_id.to_string()),
+                serde_json::json!({ "apply": false, "would_revoke": would }),
+            )?;
+            return Ok(would);
+        }
+
+        // apply: flip the policy revoked flag, then revoke every live bearer.
+        if let Some(mut row) = inner.store.load_relay_policy(relay_id)? {
+            row.policy.revoked = true;
+            inner.store.save_relay_policy(row)?;
+        }
+        // Flip + re-MAC every live bearer in the ENGINE (DEK live) rather than via the store-side
+        // `revoke_bearers_for_relay`, which would set `revoked` without recomputing the DEK-keyed row
+        // MAC and so leave the rows failing their own authenticity check on the next swap. We flip the
+        // authenticated `revoked` flag and reseal the row MAC over it, keeping the row valid AND
+        // revoked. A locked vault cannot revoke (no DEK) — fail closed with an Err.
+        let mut n = 0u32;
+        for mut b in inner.store.list_bearers_for_relay(relay_id)? {
+            if !b.revoked {
+                b.revoked = true;
+                self.reseal_bearer_row(&mut b)?;
+                inner.store.save_bearer(b)?;
+                n += 1;
+            }
+        }
+
+        self.audit_ok(
+            sink,
+            "relay_revoked",
+            Some(relay_id.to_string()),
+            serde_json::json!({ "apply": true, "revoked": n }),
+        )?;
+        sink.emit(SecretEvent::RelayRevoked {
+            relay: relay_id.to_string(),
+            reason: "operator revoke".to_string(),
+        });
+        Ok(n)
     }
-    /// Single-bearer revocation (OI-10).
+
+    /// Single-bearer revocation (OI-10). When `apply` and the bearer exists and is not already
+    /// revoked, flip it and return 1; an already-revoked or unknown bearer returns 0 (fail-closed
+    /// count). Dry-run returns the would-flip count (0/1) without mutating. The durable audit row is
+    /// written BEFORE returning (HF-14).
     pub fn relay_revoke_bearer(
         &self,
-        _token_id: &str,
-        _apply: bool,
-        _sink: &EventSink,
+        token_id: &str,
+        apply: bool,
+        sink: &EventSink,
     ) -> anyhow::Result<u32> {
-        todo!()
+        let inner = &self.inner;
+        let row = inner.store.load_bearer(token_id)?;
+        let would_flip = matches!(&row, Some(b) if !b.revoked);
+
+        if !apply {
+            self.audit_ok(
+                sink,
+                "relay_bearer_revoked",
+                Some(token_id.to_string()),
+                serde_json::json!({ "apply": false, "would_revoke": would_flip as u32 }),
+            )?;
+            return Ok(would_flip as u32);
+        }
+
+        let n = if would_flip {
+            let mut b = row.expect("would_flip implies Some");
+            b.revoked = true;
+            // Re-authenticate the row under the live DEK so the flipped `revoked` is bound into the
+            // row MAC (else the swap path's row-MAC verify would reject the legitimately-revoked
+            // row as tampered). A locked vault cannot revoke — fail closed with an Err.
+            self.reseal_bearer_row(&mut b)?;
+            inner.store.save_bearer(b)?;
+            1u32
+        } else {
+            0u32
+        };
+        self.audit_ok(
+            sink,
+            "relay_bearer_revoked",
+            Some(token_id.to_string()),
+            serde_json::json!({ "apply": true, "revoked": n }),
+        )?;
+        if n == 1 {
+            sink.emit(SecretEvent::RelayRevoked {
+                relay: token_id.to_string(),
+                reason: "bearer revoke".to_string(),
+            });
+        }
+        Ok(n)
     }
     /// Hot path: default-deny by construction — the real key is fetched only inside `Allowed`;
     /// any internal error becomes `InternalRefused` (a durable-audited 403), never `send()` (CF-9).
+    ///
+    /// The real secret is read from the unlocked vault ONLY inside the `Allow` branch and goes ONLY
+    /// to `Upstream::send` — it is NEVER put in a `SecretEvent`, an audit row, an `Err`, or the
+    /// return value. A `Deny` (or any internal error) never fetches the key and never reaches the
+    /// upstream. All locks are dropped before the `.await` (the real key is moved out as an owned
+    /// `Zeroizing<Vec<u8>>`).
     pub async fn relay_swap(
         &self,
-        _bearer: &str,
-        _req: &EgressReq,
-        _sink: &EventSink,
+        bearer: &str,
+        req: &EgressReq,
+        sink: &EventSink,
     ) -> SwapOutcome {
-        todo!()
+        // The whole pre-await body is fallible; funnel any `?` (lock poison / store error) into a
+        // durable-audited `InternalRefused` so an internal error can NEVER fail-open into a send.
+        match self.relay_swap_prepare(bearer, req, sink) {
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = self.audit_failed(
+                    sink,
+                    "relay_swapped",
+                    None,
+                    serde_json::json!({ "reason": "internal", "detail": msg }),
+                );
+                SwapOutcome::InternalRefused(msg)
+            }
+            // Deny: already audited + emitted inside prepare; the key was never fetched.
+            Ok(Prepared::Deny(reason)) => SwapOutcome::Denied(reason),
+            // Allow: prepare already extracted the real key (under the now-released lock) and the
+            // matched relay metadata. ONLY NOW do we await the upstream.
+            Ok(Prepared::Allow(allow)) => {
+                let owned = EgressReq {
+                    method: req.method,
+                    host: req.host.clone(),
+                    path: req.path.clone(),
+                    headers: req.headers.clone(),
+                    bytes_out: req.bytes_out,
+                    peer_uid: req.peer_uid,
+                    peer_pid: req.peer_pid,
+                };
+                // HF-11 send-site fence (belt-and-suspenders): re-assert that the EXACT host about to
+                // receive the real key is in the provider's frozen canonical allowlist, immediately
+                // before send. `decide` already checked this, but re-checking here against the host
+                // carried in `allow` (and `owned.host`) forecloses any divergence if the actual
+                // upstream target ever becomes a function of an adapter/base-url rewrite. A miss
+                // refuses WITHOUT sending — the key (still in `allow`) is dropped/zeroized.
+                if !canonical_upstreams(allow.provider)
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&owned.host) && h.eq_ignore_ascii_case(&allow.host))
+                {
+                    let _ = self.audit_failed(
+                        sink,
+                        "relay_swapped",
+                        Some(allow.relay_id.clone()),
+                        serde_json::json!({
+                            "token_id": allow.token_id,
+                            "reason": "upstream_fence",
+                            "allowed": false,
+                        }),
+                    );
+                    return SwapOutcome::InternalRefused("upstream host fence".to_string());
+                }
+                match self.inner.upstream.send(owned, &allow.real_key).await {
+                    Ok(resp) => {
+                        let _ = self.audit_ok(
+                            sink,
+                            "relay_swapped",
+                            Some(allow.relay_id.clone()),
+                            serde_json::json!({
+                                "token_id": allow.token_id,
+                                "host": req.host,
+                                "method": method_str(req.method),
+                                "allowed": true,
+                            }),
+                        );
+                        sink.emit(SecretEvent::RelaySwapped {
+                            relay: allow.relay_id,
+                            host: req.host.clone(),
+                            method: method_str(req.method).to_string(),
+                            allowed: true,
+                            token_id: allow.token_id,
+                            client_uid: req.peer_uid.unwrap_or(self.inner.owner_uid),
+                            client_label: String::new(),
+                        });
+                        SwapOutcome::Allowed(resp)
+                    }
+                    Err(ue) => {
+                        // The real key went ONLY to send(); it is dropped (zeroized) with `allow`.
+                        // CRITICAL containment: an upstream adapter is the one component that just
+                        // received the REAL key. Its error STRING is untrusted — a buggy/hostile
+                        // adapter could echo the auth header / key bytes into `ue.to_string()`. We
+                        // therefore NEVER propagate the raw error text into the durable audit row or
+                        // the caller-visible outcome; we map it to a fixed, key-free DISCRIMINANT
+                        // label only, preserving the "never in an audit row / Err / return value"
+                        // invariant.
+                        let kind = upstream_error_kind(&ue);
+                        let _ = self.audit_failed(
+                            sink,
+                            "relay_swapped",
+                            Some(allow.relay_id.clone()),
+                            serde_json::json!({
+                                "token_id": allow.token_id,
+                                "reason": "upstream",
+                                "kind": kind,
+                            }),
+                        );
+                        SwapOutcome::InternalRefused(format!("upstream send failed ({kind})"))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The synchronous, fallible pre-await half of `relay_swap`: parse + verify the bearer, snapshot
+    /// the clock/floor/USB gate, run the PURE `decide`, and — only on `Allow` — extract the real key
+    /// while still holding the vault read lock, then release every lock before returning so the
+    /// caller can `.await` the upstream with no guard held. A `Deny` is audited + emitted here (the
+    /// key is never fetched); any `Err` is mapped to `InternalRefused` by the caller.
+    fn relay_swap_prepare(
+        &self,
+        bearer: &str,
+        req: &EgressReq,
+        sink: &EventSink,
+    ) -> anyhow::Result<Prepared> {
+        let inner = &self.inner;
+
+        // 1. Parse. A malformed / foreign bearer is UnknownBearer (no store hit, no crypto).
+        let Some((token_id, raw)) = parse_bearer(bearer) else {
+            return Ok(Prepared::Deny(self.deny_swap(sink, None, None, DenyReason::UnknownBearer)?));
+        };
+
+        // 2. Snapshot under the vault READ lock. A poisoned lock fails closed (mapped to
+        // InternalRefused by the caller), never a panic that unwinds past the deny funnel.
+        let v = inner.vault.read().map_err(|_| anyhow::anyhow!("vault lock poisoned"))?;
+        let dek = match v.dek() {
+            Some(d) => d,
+            // A locked vault returns InternalRefused (never a send) — fail-closed.
+            None => anyhow::bail!("vault is locked"),
+        };
+        let now_ms = inner.clock.now().timestamp_millis();
+        let boottime_now_ms = inner.clock.boottime_ms();
+        let issuance_floor_ms = self.load_issuance_floor()?;
+
+        // Load the bearer row by the public token_id (O(1)); a miss is UnknownBearer.
+        let Some(row) = inner.store.load_bearer(token_id)? else {
+            drop(v);
+            return Ok(Prepared::Deny(self.deny_swap(sink, None, Some(token_id), DenyReason::UnknownBearer)?));
+        };
+
+        // Constant-time MAC verify over the WHOLE wire string. A forged/wrong secret cannot be
+        // distinguished from an absent bearer => UnknownBearer (no oracle).
+        let hmac_key = broker_hmac_key(dek);
+        if !verify_bearer(&hmac_key, raw, &row.mac) {
+            drop(hmac_key);
+            drop(v);
+            return Ok(Prepared::Deny(self.deny_swap(sink, None, Some(token_id), DenyReason::UnknownBearer)?));
+        }
+        drop(hmac_key);
+
+        // Constant-time verify of the DEK-keyed ROW MAC over the clear-text metadata (CRITICAL fix).
+        // This is what stops a store-level attacker from flipping `revoked`, raising `expires_at_ms`,
+        // rewriting the peer binding, or repointing `policy_id` to forge an Allow: any such tamper
+        // makes the recomputed MAC diverge from the stored one. A mismatch is indistinguishable from
+        // an absent/forged bearer => UnknownBearer (no oracle), and the real key is never fetched.
+        let row_mac_key = broker_row_mac_key(dek);
+        let row_msg = bearer_row_mac_message(
+            &row.token_id,
+            row.policy_id,
+            row.expires_at_ms,
+            row.issued_at_ms,
+            row.issued_boottime_ms,
+            row.client_uid,
+            row.client_pid,
+            row.revoked,
+        );
+        if !verify_bearer_row(&row_mac_key, &row_msg, &row.row_mac) {
+            drop(row_mac_key);
+            drop(v);
+            return Ok(Prepared::Deny(self.deny_swap(sink, None, Some(token_id), DenyReason::UnknownBearer)?));
+        }
+        drop(row_mac_key);
+
+        // Load the matched policy by the bearer's policy_id (the linkage key). A miss, or a policy
+        // whose assigned id disagrees with the bearer, is treated as UnknownBearer (never a
+        // successful Allow against a mismatched pair).
+        let policy_row = match self.find_policy_by_id(row.policy_id)? {
+            Some(pr) => pr,
+            None => {
+                drop(v);
+                return Ok(Prepared::Deny(self.deny_swap(sink, None, Some(token_id), DenyReason::UnknownBearer)?));
+            }
+        };
+        let relay_id = policy_row.policy.relay_id.clone();
+        let secret_name = policy_row.policy.secret_name.clone();
+
+        // USB possession gate snapshot: absent => the gate is currently unproven.
+        let usb_absent_since_ms = if self.usb_possession_proven()? {
+            None
+        } else {
+            Some(now_ms)
+        };
+
+        // 3. Bump the broker's ephemeral usage counters (post-bump tallies feed the pure budgets). A
+        // poisoned broker lock fails closed (Err -> InternalRefused), never a panic.
+        let (total_requests, total_bytes, rate_in_window) = {
+            let mut broker = inner
+                .broker
+                .write()
+                .map_err(|_| anyhow::anyhow!("broker lock poisoned"))?;
+            broker.bump(&row.token_id, now_ms, req.bytes_out)
+        };
+
+        let vb = VerifiedBearer {
+            policy_id: row.policy_id,
+            token_id: row.token_id.clone(),
+            expires_at_ms: row.expires_at_ms,
+            issued_at_ms: row.issued_at_ms,
+            issued_boottime_ms: row.issued_boottime_ms,
+            client_uid: row.client_uid,
+            client_pid: row.client_pid,
+            revoked: row.revoked,
+        };
+        let canon = CanonRequest {
+            method: req.method,
+            host: req.host.clone(),
+            sni: trusted_sni_for(&policy_row.policy.swap, req),
+            path: req.path.clone(),
+            bytes_out: req.bytes_out,
+            peer_uid: req.peer_uid,
+            peer_pid: req.peer_pid,
+            usage_requests: total_requests,
+            usage_bytes: total_bytes,
+            rate_in_window,
+        };
+
+        // 4. The PURE, default-deny decision (expiry fenced against BOTH the wall and monotonic
+        // clocks).
+        match decide(
+            &policy_row.policy,
+            &vb,
+            &canon,
+            now_ms,
+            boottime_now_ms,
+            usb_absent_since_ms,
+            issuance_floor_ms,
+        ) {
+            RelayDecision::Deny { reason } => {
+                drop(v);
+                Ok(Prepared::Deny(self.deny_swap(sink, Some(relay_id), Some(token_id), reason)?))
+            }
+            RelayDecision::Allow => {
+                // ONLY NOW fetch the real secret — internal open, reveal=false-internal — producing
+                // an owned Zeroizing<Vec<u8>>. We are still holding the vault read lock, so the DEK
+                // is live; we extract the key, then drop EVERY lock before returning so the caller
+                // can await with no guard held. The real key goes ONLY into the returned `Allow`.
+                let real_key = self.open_real_key(dek, &secret_name)?;
+                drop(v);
+                // Carry the provider + the canonical host so `relay_swap` can re-assert the HF-11
+                // upstream-host fence IMMEDIATELY before send (belt-and-suspenders: decide() already
+                // checked it, but the send-site gate forecloses any future divergence between the
+                // host decide saw and the host actually sent).
+                Ok(Prepared::Allow(AllowPrepared {
+                    relay_id,
+                    token_id: row.token_id,
+                    provider: policy_row.policy.provider,
+                    host: req.host.clone(),
+                    real_key,
+                }))
+            }
+        }
+    }
+
+    /// Open the real secret for an Allowed swap, reconstructing the canonical record AAD exactly as
+    /// `secret_get` does. Returns the plaintext as an owned `Zeroizing<Vec<u8>>` — this is the ONLY
+    /// place the real key materializes on the swap path, and it flows ONLY to `Upstream::send`.
+    fn open_real_key(
+        &self,
+        dek: &keyslot::Dek,
+        secret_name: &str,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        let row = self
+            .inner
+            .store
+            .get_secret_latest(secret_name)?
+            .ok_or_else(|| anyhow::anyhow!("relay secret '{secret_name}' not found"))?;
+        let aad = record_aad(
+            TableTag::SecretVersion,
+            row.row_id,
+            row.version as i64,
+            row.dek_generation,
+        );
+        vault::crypto::open(dek, &aad, &row.nonce, &row.ct_tag)
+            .ok_or_else(|| anyhow::anyhow!("relay secret '{secret_name}' failed authentication"))
+    }
+
+    /// Find a relay policy row by its assigned id (the bearer linkage key). Linear scan of the
+    /// policy set; the store has no id index in 1b/Phase 4 InMem.
+    fn find_policy_by_id(&self, policy_id: i64) -> anyhow::Result<Option<RelayPolicyRow>> {
+        Ok(self
+            .inner
+            .store
+            .list_relay_policies()?
+            .into_iter()
+            .find(|r| r.id == policy_id))
+    }
+
+    /// Recompute the DEK-keyed row MAC over a bearer row's CURRENT (security-critical) fields and
+    /// write it back into `row.row_mac`. Called on every legitimate row mutation (mint reseals
+    /// inline; revoke reseals here) so the persisted row always carries a MAC that matches its
+    /// clear-text state. Requires the vault unlocked (`Err(Locked)` otherwise — a locked vault can
+    /// neither mint nor revoke, fail-closed).
+    fn reseal_bearer_row(&self, row: &mut BearerRow) -> anyhow::Result<()> {
+        let v = self.inner.vault.read().map_err(|_| anyhow::anyhow!("vault lock poisoned"))?;
+        let dek = match v.dek() {
+            Some(d) => d,
+            None => return Err(EngineError::Locked.into()),
+        };
+        let row_mac_key = broker_row_mac_key(dek);
+        row.row_mac = mac_bearer_row(
+            &row_mac_key,
+            &bearer_row_mac_message(
+                &row.token_id,
+                row.policy_id,
+                row.expires_at_ms,
+                row.issued_at_ms,
+                row.issued_boottime_ms,
+                row.client_uid,
+                row.client_pid,
+                row.revoked,
+            ),
+        )
+        .to_vec();
+        drop(row_mac_key);
+        Ok(())
+    }
+
+    /// Whether USB possession is currently PROVEN: some enabled USB keyslot's keyfile is obtainable
+    /// (a UUID match alone is not possession, CF-4). When the vault has NO USB keyslot enrolled, the
+    /// gate is vacuously satisfied (a passphrase-only vault is not USB-gated).
+    fn usb_possession_proven(&self) -> anyhow::Result<bool> {
+        let slots = self.inner.store.load_keyslots()?;
+        let usb_slots: Vec<_> = slots
+            .iter()
+            .filter(|s| s.enabled && s.factor == Factor::Usb)
+            .collect();
+        if usb_slots.is_empty() {
+            return Ok(true);
+        }
+        for s in usb_slots {
+            if let Some(uuid) = s.usb_partition_uuid.as_deref() {
+                if self.inner.usb.keyfile_for(uuid).is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Audit + emit a denied swap (the real key is NEVER fetched on this branch) and return the
+    /// reason so the caller can wrap it in `SwapOutcome::Denied`.
+    fn deny_swap(
+        &self,
+        sink: &EventSink,
+        relay_id: Option<String>,
+        token_id: Option<&str>,
+        reason: DenyReason,
+    ) -> anyhow::Result<DenyReason> {
+        let reason_str = serde_json::to_value(reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{reason:?}"));
+        self.audit(
+            sink,
+            "relay_swapped",
+            relay_id.clone(),
+            serde_json::json!({
+                "token_id": token_id,
+                "reason": reason_str,
+                "allowed": false,
+            }),
+            AuditOutcome::Refused,
+        )?;
+        sink.emit(SecretEvent::RelaySwapped {
+            relay: relay_id.unwrap_or_default(),
+            host: String::new(),
+            method: String::new(),
+            allowed: false,
+            token_id: token_id.unwrap_or("").to_string(),
+            client_uid: self.inner.owner_uid,
+            client_label: String::new(),
+        });
+        Ok(reason)
     }
     /// Operator-issued NON-MITM leaves only; REFUSES `usage = mitm_leaf` (CF-5).
     pub fn ca_issue(
@@ -863,6 +1476,100 @@ impl Engine {
         s.parse::<i64>()
             .map_err(|_| anyhow::anyhow!("dek_generation is not a valid integer"))
     }
+}
+
+/// The result of `relay_swap_prepare`: either a (already-audited) deny, or an allow carrying the
+/// extracted real key + the metadata `relay_swap` needs to audit/emit the successful send. The real
+/// key lives here only until `send()` consumes it; `Zeroizing` wipes it on drop.
+enum Prepared {
+    Deny(DenyReason),
+    Allow(AllowPrepared),
+}
+
+struct AllowPrepared {
+    relay_id: String,
+    token_id: String,
+    /// Provider + the exact host that will be sent — carried so `relay_swap` can re-assert the HF-11
+    /// canonical-upstream fence at the send site (not solely inside `decide`).
+    provider: Provider,
+    host: String,
+    /// The real secret — flows ONLY to `Upstream::send`; never audited/emitted/returned.
+    real_key: Zeroizing<Vec<u8>>,
+}
+
+/// Decide the SNI value `decide` binds against the verified inner Host (HF-9), per swap mode.
+///
+/// SECURITY NOTE (anti-fronting): the `sni` value here is read from a request header, which is
+/// CLIENT-CONTROLLED — a malicious client can set it to match its Host (or omit it) to no-op the
+/// check. So it is NOT a security control in modes where the engine does not observe the real TLS
+/// SNI. We therefore split by `SwapMode`:
+///
+///   * `ProxyMitm` — the relay terminates TLS, so a genuine TLS-observed SNI is REQUIRED to enforce
+///     anti-fronting. Until the proxy plumbs the observed SNI as a trusted field (Phase-4+), we fail
+///     CLOSED: synthesize a sentinel SNI that can never equal the inner Host, so `decide` returns
+///     `SniHostMismatch` rather than silently trusting the client header.
+///   * everything else — there is no TLS termination at the relay, so there is nothing for the
+///     engine to observe; we return `None` (the check is a documented no-op) instead of pretending a
+///     client-supplied header is a real SNI.
+fn trusted_sni_for(swap: &SwapMode, _req: &EgressReq) -> Option<String> {
+    match swap {
+        // Fail closed: a sentinel that cannot match any real host (the leading byte is illegal in a
+        // DNS name), forcing SniHostMismatch until a trusted, TLS-observed SNI is plumbed in.
+        SwapMode::ProxyMitm => Some("\u{0}untrusted-sni-not-observed".to_string()),
+        _ => None,
+    }
+}
+
+/// A fixed, key-free label for an `UpstreamError` DISCRIMINANT — never its `Display` string (which
+/// is adapter-controlled and could echo the real key). Used for the audit row + the refused outcome.
+fn upstream_error_kind(e: &seam::UpstreamError) -> &'static str {
+    match e {
+        seam::UpstreamError::Io(_) => "io",
+        seam::UpstreamError::HostNotAllowed(_) => "host_not_allowed",
+    }
+}
+
+fn method_str(m: Method) -> &'static str {
+    match m {
+        Method::Get => "GET",
+        Method::Head => "HEAD",
+        Method::Post => "POST",
+        Method::Put => "PUT",
+        Method::Patch => "PATCH",
+        Method::Delete => "DELETE",
+        Method::Connect => "CONNECT",
+        Method::Options => "OPTIONS",
+    }
+}
+
+/// Format epoch-millis as an RFC3339 UTC string for the bearer's `expires_at` (cosmetic; the
+/// authoritative deadline is the stored `expires_at_ms`).
+fn ms_to_rfc3339(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(0).unwrap())
+        .to_rfc3339()
+}
+
+/// base64url, no padding (RFC 4648 §5). Used for the bearer secret (the actual authenticator). Pure
+/// table-driven encode — no extra dependency.
+fn b64url_nopad(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 0x3f) as usize] as char);
+        }
+    }
+    out
 }
 
 /// Read the effective owner uid (the real uid the daemon runs as). Falls back to 0 on platforms

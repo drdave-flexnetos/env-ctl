@@ -13,8 +13,15 @@ impl Clock for SystemClock {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
     }
+    /// `CLOCK_BOOTTIME` in milliseconds: a monotonic counter since boot that INCLUDES suspend time
+    /// and CANNOT be stepped backward by the operator, NTP, or a settimeofday() rollback — exactly
+    /// the property the OI-6 relay rollback fence needs. Read via `rustix::time::clock_gettime`
+    /// (pure-Rust linux_raw syscall on Linux; no C). Saturating ms conversion; never panics.
     fn boottime_ms(&self) -> i64 {
-        todo!()
+        let ts = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+        ts.tv_sec
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec / 1_000_000)
     }
 }
 

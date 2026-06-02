@@ -49,19 +49,49 @@ pub fn mac_bearer(hmac_key: &[u8; 32], presented: &str) -> [u8; 32] {
 /// observable work does not branch on whether the lengths matched.
 pub fn verify_bearer(hmac_key: &[u8; 32], presented: &str, stored_mac: &[u8]) -> bool {
     let computed: [u8; MAC_LEN] = mac_bearer(hmac_key, presented);
+    ct_eq_mac(&computed, stored_mac)
+}
 
-    // A correct stored MAC is always exactly MAC_LEN bytes. `subtle::ConstantTimeEq` for `[u8]`
-    // already requires equal lengths (it returns 0 for a length mismatch *after* comparing the
-    // common prefix in constant time), so feeding it `stored_mac` directly is both correct and
-    // free of an early `return false`. We still gate on the length flag below so the result is
-    // unambiguous and does not depend on `ct_eq`'s internal length handling.
-    //
-    // `Choice`/`u8` math keeps everything data-dependency-only (no `if` on secret-derived values):
-    //   len_ok  = 1 iff stored_mac.len() == MAC_LEN, else 0   (length is public, not secret)
-    //   mac_eq  = 1 iff the bytes match in constant time
+/// Keyed MAC over the AUTHENTICATED bearer-row metadata (the mint/revoke side).
+///
+/// The wire MAC (`mac_bearer`) only authenticates the opaque `evrelay_{token_id}_{secret}` string,
+/// so every security-critical field of the persisted row — `revoked`, `expires_at_ms`,
+/// `issued_at_ms`, `issued_boottime_ms`, `policy_id`, `client_uid`, `client_pid` — was stored in the
+/// CLEAR with nothing binding it. A store-level attacker could flip `revoked:true->false`, raise
+/// `expires_at_ms`, rewrite the peer binding, or repoint `policy_id` at a more permissive policy and
+/// the wire MAC would STILL verify (it never sees those fields), reaching `Allow` (CRITICAL).
+///
+/// This MAC closes that gap: the engine recomputes it over the canonical encoding of the row's
+/// security fields (`row_mac_message`) under a DEK-derived, domain-separated key on every write
+/// (mint AND revoke — the only places the row legitimately changes) and re-verifies it before the
+/// pure `decide`. Without the unlocked DEK an attacker cannot produce a matching tag, so any tamper
+/// fails closed (treated as `UnknownBearer`, no oracle). It is `blake3::keyed_hash` (a native keyed
+/// PRF, immune to length-extension), domain-separated from the wire-bearer key, the header MAC, and
+/// the audit-head anchor.
+pub fn mac_bearer_row(row_mac_key: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(row_mac_key, message).as_bytes()
+}
+
+/// Returns true iff `message` MACs (under `row_mac_key`) to `stored_mac`, compared in constant time.
+/// Mint and revoke both funnel through `mac_bearer_row`, so the two sides can never drift.
+pub fn verify_bearer_row(row_mac_key: &[u8; 32], message: &[u8], stored_mac: &[u8]) -> bool {
+    let computed: [u8; MAC_LEN] = mac_bearer_row(row_mac_key, message);
+    ct_eq_mac(&computed, stored_mac)
+}
+
+/// Constant-time MAC comparison shared by the wire-bearer and row-metadata verifiers.
+///
+/// `stored_mac` is whatever the store handed back; it is attacker-influenceable in length, so a
+/// wrong length is treated as a non-match **without an early-return timing leak**: we always compare
+/// against `computed`, then fold the (public) length check into the constant-time path so the
+/// observable work does not branch on whether the lengths matched.
+///
+/// `Choice`/`u8` math keeps everything data-dependency-only (no `if` on secret-derived values):
+///   len_ok  = 1 iff stored_mac.len() == MAC_LEN, else 0   (length is public, not secret)
+///   mac_eq  = 1 iff the bytes match in constant time
+fn ct_eq_mac(computed: &[u8; MAC_LEN], stored_mac: &[u8]) -> bool {
     let len_ok: u8 = (stored_mac.len() == MAC_LEN) as u8;
     let mac_eq: u8 = computed.as_slice().ct_eq(stored_mac).unwrap_u8();
-
     (len_ok & mac_eq) == 1
 }
 
